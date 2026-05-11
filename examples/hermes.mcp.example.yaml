@@ -1,0 +1,12 @@
+mcp_servers:
+  facebook_marketplace:
+    command: "node"
+    args:
+      - "/Users/saber/Documents/facebook_mcp/dist/index.js"
+    env:
+      FB_MARKETPLACE_DATA_DIR: "/Users/saber/.hermes/facebook-marketplace"
+      FB_MARKETPLACE_HOME_LOCATION: "Minneapolis, MN"
+      FB_HEADLESS: "false"
+    timeout: 180
+    connect_timeout: 60
+
