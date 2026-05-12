@@ -163,6 +163,120 @@ export async function upsertMessageThread(
   });
 }
 
+export async function recordSentReply(
+  config: RuntimeConfig,
+  details: {
+    thread: MessageThreadRecord;
+    message: string;
+    sentAt: string;
+    approvalToken: string;
+    riskLevel: string;
+  }
+): Promise<MarketplaceMessageRecord> {
+  const db = await openMessageDb(config);
+  const message: MarketplaceMessageRecord = {
+    message_id: makeMessageId([
+      details.thread.thread_id,
+      "seller",
+      details.message,
+      details.sentAt
+    ]),
+    thread_id: details.thread.thread_id,
+    listing_id: details.thread.listing_id,
+    buyer_name: details.thread.buyer_name,
+    role: "seller",
+    text: details.message,
+    timestamp: details.sentAt,
+    first_seen_at: details.sentAt,
+    seen_at: details.sentAt,
+    requires_response: false,
+    raw_text: details.message
+  };
+
+  const approvalTokenHash = createHash("sha256")
+    .update(details.approvalToken.trim())
+    .digest("hex");
+
+  db.exec("BEGIN");
+  try {
+    db.prepare(`
+      INSERT INTO message_threads (
+        thread_id, listing_id, buyer_name, listing_title, status, url,
+        last_message_at, first_seen_at, last_seen_at, raw_text
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(thread_id) DO UPDATE SET
+        listing_id = COALESCE(excluded.listing_id, message_threads.listing_id),
+        buyer_name = excluded.buyer_name,
+        listing_title = COALESCE(excluded.listing_title, message_threads.listing_title),
+        status = excluded.status,
+        url = excluded.url,
+        last_message_at = excluded.last_message_at,
+        last_seen_at = excluded.last_seen_at
+    `).run(
+      details.thread.thread_id,
+      details.thread.listing_id,
+      details.thread.buyer_name,
+      details.thread.listing_title,
+      details.thread.status,
+      details.thread.url,
+      details.sentAt,
+      details.thread.first_seen_at,
+      details.sentAt,
+      details.thread.raw_text ?? null
+    );
+
+    db.prepare(`
+      INSERT INTO messages (
+        message_id, thread_id, listing_id, buyer_name, role, text, timestamp,
+        first_seen_at, seen_at, requires_response, raw_text
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET
+        seen_at = excluded.seen_at,
+        raw_text = excluded.raw_text
+    `).run(
+      message.message_id,
+      message.thread_id,
+      message.listing_id,
+      message.buyer_name,
+      message.role,
+      message.text,
+      message.timestamp,
+      message.first_seen_at,
+      message.seen_at,
+      0,
+      message.raw_text ?? null
+    );
+
+    db.prepare(`
+      INSERT INTO sent_replies (
+        sent_reply_id, thread_id, listing_id, buyer_name, message,
+        sent_at, approval_token_hash, risk_level
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      `sent_${message.message_id.slice(4)}`,
+      details.thread.thread_id,
+      details.thread.listing_id,
+      details.thread.buyer_name,
+      details.message,
+      details.sentAt,
+      approvalTokenHash,
+      details.riskLevel
+    );
+
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    db.close();
+    throw error;
+  }
+
+  db.close();
+  return message;
+}
+
 export function makeMessageId(parts: string[]): string {
   const digest = createHash("sha256").update(parts.join("\u001f")).digest("hex").slice(0, 24);
   return `msg_${digest}`;
@@ -207,6 +321,21 @@ async function openMessageDb(config: RuntimeConfig): Promise<DatabaseSync> {
 
     CREATE INDEX IF NOT EXISTS messages_thread_timestamp_idx
       ON messages(thread_id, timestamp);
+
+    CREATE TABLE IF NOT EXISTS sent_replies (
+      sent_reply_id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      listing_id TEXT,
+      buyer_name TEXT NOT NULL,
+      message TEXT NOT NULL,
+      sent_at TEXT NOT NULL,
+      approval_token_hash TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      FOREIGN KEY(thread_id) REFERENCES message_threads(thread_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS sent_replies_thread_sent_at_idx
+      ON sent_replies(thread_id, sent_at);
   `);
   await fs.chmod(config.messagesDbPath, 0o600).catch(() => undefined);
   return db;

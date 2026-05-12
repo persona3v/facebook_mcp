@@ -6,10 +6,12 @@ import { loadConfig } from "./config.js";
 import {
   checkMarketplaceMessages,
   closeBrowserContext,
+  draftReplyForThread,
   fillListingForm,
   getMessageThread,
   getListingDetail,
-  listMyListings
+  listMyListings,
+  sendReply
 } from "./facebook.js";
 import { ensureMessageStore } from "./messageStore.js";
 import {
@@ -56,6 +58,18 @@ const checkMarketplaceMessagesSchema = {
 
 const getMessageThreadSchema = {
   thread_id: z.string().min(1)
+};
+
+const draftReplySchema = {
+  thread_id: z.string().min(1),
+  intent: z.string().min(1).default("availability"),
+  constraints: z.record(z.unknown()).default({})
+};
+
+const sendReplySchema = {
+  thread_id: z.string().min(1),
+  message: z.string().trim().min(1).max(2000),
+  approval_token: z.string().trim().min(8)
 };
 
 const server = new McpServer({
@@ -195,6 +209,42 @@ server.registerTool(
   },
   async (input) => {
     const result = await getMessageThread(config, input.thread_id);
+    return jsonResult(result);
+  }
+);
+
+server.registerTool(
+  "draft_reply",
+  {
+    title: "Draft a Facebook Marketplace buyer reply",
+    description:
+      "Generate a local reply draft from a saved Marketplace/Messenger thread and classify reply risk. This never sends a message.",
+    inputSchema: draftReplySchema
+  },
+  async (input) => {
+    const result = await draftReplyForThread(config, {
+      threadId: input.thread_id,
+      intent: input.intent,
+      constraints: input.constraints
+    });
+    return jsonResult(result);
+  }
+);
+
+server.registerTool(
+  "send_reply",
+  {
+    title: "Send a human-approved Facebook Marketplace buyer reply",
+    description:
+      "Open a saved Marketplace/Messenger thread, send a reply only when an approval token is supplied, and log the sent message locally.",
+    inputSchema: sendReplySchema
+  },
+  async (input) => {
+    const result = await sendReply(config, {
+      threadId: input.thread_id,
+      message: input.message,
+      approvalToken: input.approval_token
+    });
     return jsonResult(result);
   }
 );
