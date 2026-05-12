@@ -50,6 +50,7 @@ export function loadConfig(): RuntimeConfig {
     photosDir: path.join(dataDir, "photos"),
     screenshotsDir: path.join(dataDir, "screenshots"),
     logsDir: path.join(dataDir, "logs"),
+    messagesDbPath: path.join(dataDir, "messages.db"),
     browserUserDataDir,
     browserChannel: optionalEnv("FB_BROWSER_CHANNEL"),
     chromeProfileName: optionalEnv("FB_CHROME_PROFILE_NAME"),
@@ -59,6 +60,9 @@ export function loadConfig(): RuntimeConfig {
     marketplaceSellingUrl:
       optionalEnv("FB_MARKETPLACE_SELLING_URL") ??
       "https://www.facebook.com/marketplace/you/selling",
+    marketplaceMessagesUrl:
+      optionalEnv("FB_MARKETPLACE_MESSAGES_URL") ??
+      "https://www.facebook.com/marketplace/inbox",
     defaultLocation: optionalEnv("FB_MARKETPLACE_HOME_LOCATION"),
     headless: boolEnv("FB_HEADLESS", false),
     slowMoMs: numberEnv("FB_SLOW_MO_MS", 50)

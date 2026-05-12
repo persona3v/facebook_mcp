@@ -1,6 +1,6 @@
 # Facebook Marketplace Assistant MCP
 
-Local Phase 1 and Phase 2 MCP server for creating Facebook Marketplace listing drafts, filling the Marketplace listing form, and reading seller listings through Playwright.
+Local Phase 1, Phase 2, and Phase 3 MCP server for creating Facebook Marketplace listing drafts, filling the Marketplace listing form, reading seller listings, and monitoring buyer messages through Playwright.
 
 This implementation follows the safety boundary in `facebook-marketplace-assistant-mcp-spec.md`:
 
@@ -72,6 +72,33 @@ Input:
 }
 ```
 
+### `check_marketplace_messages`
+
+Opens the configured Facebook Marketplace/Messenger inbox URL, scrapes visible buyer threads, stores them in local SQLite message memory, and returns newly seen buyer messages.
+
+Input:
+
+```json
+{
+  "since": "last_check",
+  "include_read": false,
+  "max_threads": 20,
+  "max_scrolls": 3
+}
+```
+
+### `get_message_thread`
+
+Opens a saved Marketplace/Messenger thread, scrapes visible messages, updates local message memory, and returns the thread conversation.
+
+Input:
+
+```json
+{
+  "thread_id": "thread_abc"
+}
+```
+
 ## Setup
 
 Install dependencies:
@@ -101,6 +128,7 @@ Important variables:
 - `FB_MARKETPLACE_DATA_DIR`: local state directory. Default: `~/.hermes/facebook-marketplace`.
 - `FB_MARKETPLACE_HOME_LOCATION`: fallback listing location.
 - `FB_MARKETPLACE_SELLING_URL`: seller listings URL. Default: `https://www.facebook.com/marketplace/you/selling`.
+- `FB_MARKETPLACE_MESSAGES_URL`: Marketplace/Messenger inbox URL. Default: `https://www.facebook.com/marketplace/inbox`.
 - `FB_CHROME_USER_DATA_DIR`: browser profile directory. Default: `~/.hermes/facebook-marketplace/browser-profile`.
 - `FB_BROWSER_CHANNEL`: optional browser channel, for example `chrome`.
 - `FB_CHROME_PROFILE_NAME`: optional Chrome profile name when using a Chrome user data directory.
@@ -130,6 +158,7 @@ Default local state:
   logs/
   browser-profile/
   inventory.json
+  messages.db
 ```
 
 The server creates these directories with restricted permissions when possible.
@@ -140,4 +169,6 @@ Facebook Marketplace selectors can change. The form filler uses resilient label 
 
 Phase 2 listing reads depend on Facebook's current web UI. The scraper stores visible listing metadata in `inventory.json`, but some fields may remain `null` when Facebook hides them or changes the layout.
 
-This phase does not implement message polling, reply drafting, message sending, or marking listings sold.
+Phase 3 message reads depend on Facebook's current Marketplace/Messenger UI. The scraper stores visible message thread metadata in `messages.db`; Hermes should poll `check_marketplace_messages` every 1-3 minutes and send returned `new_messages` to Discord.
+
+This phase does not implement reply drafting, message sending, or marking listings sold.

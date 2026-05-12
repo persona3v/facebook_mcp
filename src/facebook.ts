@@ -2,21 +2,34 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
 import type {
+  CheckMarketplaceMessagesResult,
   FillListingResult,
+  GetMessageThreadResult,
   ListingDetailResult,
   ListingRecord,
   ListingStatus,
   ListMyListingsResult,
   ListingDraft,
+  MarketplaceMessageRecord,
+  MessageRole,
+  MessageThreadRecord,
   RuntimeConfig
 } from "./types.js";
 import {
   findListingRecord,
+  loadInventory,
   normalizeListingId,
   syncListingRecords,
   updateDraft,
   upsertListingRecord
 } from "./storage.js";
+import {
+  findMessageThread,
+  loadMessageThread,
+  makeMessageId,
+  syncMessageThreads,
+  upsertMessageThread
+} from "./messageStore.js";
 
 const SHORT_TIMEOUT_MS = 3000;
 const FIELD_TIMEOUT_MS = 8000;
@@ -200,6 +213,109 @@ export async function getListingDetail(
     ...savedRecord,
     screenshot_path: screenshotPath,
     browser_state: "listing_detail_screen",
+    notes
+  };
+}
+
+export async function checkMarketplaceMessages(
+  config: RuntimeConfig,
+  options: {
+    since: string;
+    includeRead: boolean;
+    maxThreads: number;
+    maxScrolls: number;
+  }
+): Promise<CheckMarketplaceMessagesResult> {
+  const context = await getOrLaunchContext(config);
+  const notes: string[] = [];
+  const page = await getWorkingPage(context);
+
+  await page.goto(config.marketplaceMessagesUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
+    notes.push("Facebook did not reach networkidle; scraping visible message threads.");
+  });
+
+  await scrollPage(page, options.maxScrolls);
+
+  const inventory = await loadInventory(config);
+  const scrapedThreads = await scrapeVisibleMessageThreads(
+    page,
+    inventory.listings,
+    options.maxThreads
+  );
+
+  if (scrapedThreads.length === 0) {
+    notes.push("No visible Marketplace/Messenger thread links were found.");
+  }
+
+  const { newMessages, checkedAt } = await syncMessageThreads(config, scrapedThreads, {
+    since: options.since,
+    includeRead: options.includeRead
+  });
+  const screenshotPath = await makeScreenshotPath(config, "marketplace_messages");
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+
+  return {
+    new_messages: newMessages,
+    checked_at: checkedAt,
+    screenshot_path: screenshotPath,
+    browser_state: "marketplace_messages_screen",
+    notes
+  };
+}
+
+export async function getMessageThread(
+  config: RuntimeConfig,
+  threadId: string
+): Promise<GetMessageThreadResult> {
+  const context = await getOrLaunchContext(config);
+  const notes: string[] = [];
+  const knownThread = await findMessageThread(config, threadId);
+  const resolvedThreadId = knownThread?.thread_id ?? normalizeThreadId(threadId);
+  const url = knownThread?.url ?? threadUrlFromInput(threadId);
+  const page = await getWorkingPage(context);
+
+  await page.goto(url, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
+    notes.push("Facebook did not reach networkidle; scraping visible message thread.");
+  });
+
+  const inventory = await loadInventory(config);
+  const scraped = await scrapeMessageThreadPage(
+    page,
+    inventory.listings,
+    knownThread ?? undefined,
+    resolvedThreadId,
+    url
+  );
+  await upsertMessageThread(config, scraped.thread, scraped.messages);
+  const saved = await loadMessageThread(config, scraped.thread.thread_id);
+  const screenshotPath = await makeScreenshotPath(config, scraped.thread.thread_id);
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+
+  if (!saved) {
+    throw new Error(`Message thread ${scraped.thread.thread_id} was not saved.`);
+  }
+
+  return {
+    thread_id: saved.thread.thread_id,
+    listing_id: saved.thread.listing_id,
+    buyer_name: saved.thread.buyer_name,
+    messages: saved.messages.map((message) => ({
+      role: message.role,
+      text: message.text,
+      timestamp: message.timestamp
+    })),
+    screenshot_path: screenshotPath,
+    browser_state: "message_thread_screen",
     notes
   };
 }
@@ -460,6 +576,172 @@ async function scrapeListingDetailPage(page: Page): Promise<ListingDetailScrape>
   };
 }
 
+async function scrapeVisibleMessageThreads(
+  page: Page,
+  listings: ListingRecord[],
+  maxThreads: number
+): Promise<Array<MessageThreadRecord & { messages: MarketplaceMessageRecord[] }>> {
+  const rawThreads = await page
+    .locator(
+      [
+        'a[href*="/messages/t/"]',
+        'a[href*="messenger.com/t/"]',
+        'a[href*="/marketplace/inbox"]'
+      ].join(", ")
+    )
+    .evaluateAll((anchors) => {
+      const records: Array<{ href: string; text: string }> = [];
+
+      for (const anchor of anchors as any[]) {
+        const href = anchor.href || anchor.getAttribute?.("href") || "";
+        let container = anchor;
+
+        for (let depth = 0; depth < 7 && container?.parentElement; depth += 1) {
+          const parent = container.parentElement;
+          const parentText = String(parent.innerText || parent.textContent || "");
+          const threadLinks = parent.querySelectorAll?.(
+            'a[href*="/messages/t/"], a[href*="messenger.com/t/"], a[href*="/marketplace/inbox"]'
+          );
+          if (parentText.length > 20 && threadLinks?.length <= 3) {
+            container = parent;
+          }
+        }
+
+        const text = String(container?.innerText || anchor.innerText || "")
+          .replace(/\u00a0/g, " ")
+          .trim();
+        records.push({ href, text });
+      }
+
+      return records;
+    });
+
+  const now = new Date().toISOString();
+  const byThreadId = new Map<string, MessageThreadRecord & { messages: MarketplaceMessageRecord[] }>();
+
+  for (const rawThread of rawThreads) {
+    const url = normalizeFacebookUrl(rawThread.href);
+    const threadId = threadIdFromUrl(url) ?? makeFallbackThreadId(url, rawThread.text);
+    if (byThreadId.has(threadId)) {
+      continue;
+    }
+
+    const parsed = parseThreadPreview(rawThread.text, listings, now);
+    const messageId = makeMessageId([
+      threadId,
+      parsed.lastMessageRole,
+      parsed.lastMessageText,
+      parsed.lastMessageAt
+    ]);
+    const thread: MessageThreadRecord & { messages: MarketplaceMessageRecord[] } = {
+      thread_id: threadId,
+      listing_id: parsed.listing?.listing_id ?? listingIdFromUrl(url),
+      buyer_name: parsed.buyerName,
+      listing_title: parsed.listing?.title ?? null,
+      status: "open",
+      url,
+      last_message_at: parsed.lastMessageAt,
+      first_seen_at: now,
+      last_seen_at: now,
+      raw_text: rawThread.text,
+      messages: parsed.lastMessageText
+        ? [
+            {
+              message_id: messageId,
+              thread_id: threadId,
+              listing_id: parsed.listing?.listing_id ?? listingIdFromUrl(url),
+              buyer_name: parsed.buyerName,
+              role: parsed.lastMessageRole,
+              text: parsed.lastMessageText,
+              timestamp: parsed.lastMessageAt,
+              first_seen_at: now,
+              seen_at: now,
+              requires_response:
+                parsed.lastMessageRole === "buyer" && parsed.lastMessageText.length > 0,
+              raw_text: rawThread.text
+            }
+          ]
+        : []
+    };
+
+    byThreadId.set(threadId, thread);
+    if (byThreadId.size >= maxThreads) {
+      break;
+    }
+  }
+
+  return [...byThreadId.values()];
+}
+
+async function scrapeMessageThreadPage(
+  page: Page,
+  listings: ListingRecord[],
+  knownThread: MessageThreadRecord | undefined,
+  threadId: string,
+  url: string
+): Promise<{ thread: MessageThreadRecord; messages: MarketplaceMessageRecord[] }> {
+  const raw = await page.evaluate(() => {
+    const doc = (globalThis as any).document;
+    const structuredMessages = Array.from(doc.querySelectorAll("[data-message]")).map(
+      (element: any) => ({
+        role: String(element.getAttribute("data-role") || ""),
+        timestamp: String(element.getAttribute("data-timestamp") || ""),
+        text: String(element.innerText || element.textContent || "")
+      })
+    );
+
+    return {
+      title: String(doc.querySelector("h1")?.innerText || doc.title || ""),
+      bodyText: String(doc.body?.innerText || ""),
+      structuredMessages
+    };
+  });
+  const now = new Date().toISOString();
+  const preview = parseThreadPreview(raw.bodyText, listings, now);
+  const buyerName =
+    knownThread?.buyer_name ??
+    preview.buyerName ??
+    cleanThreadTitle(raw.title) ??
+    "Unknown buyer";
+  const listing = preview.listing;
+  const parsedMessages = parseStructuredOrTextMessages(
+    raw.structuredMessages,
+    raw.bodyText,
+    buyerName,
+    now
+  );
+
+  const messages = parsedMessages.map((message) => ({
+    message_id: makeMessageId([threadId, message.role, message.text, message.timestamp]),
+    thread_id: threadId,
+    listing_id: listing?.listing_id ?? knownThread?.listing_id ?? null,
+    buyer_name: buyerName,
+    role: message.role,
+    text: message.text,
+    timestamp: message.timestamp,
+    first_seen_at: now,
+    seen_at: now,
+    requires_response: message.role === "buyer" && message.text.length > 0,
+    raw_text: message.text
+  }));
+
+  const lastMessage = messages.at(-1);
+  const thread: MessageThreadRecord = {
+    thread_id: threadId,
+    listing_id: listing?.listing_id ?? knownThread?.listing_id ?? null,
+    buyer_name: buyerName,
+    listing_title: listing?.title ?? knownThread?.listing_title ?? null,
+    status: "open",
+    url,
+    last_message_at: lastMessage?.timestamp ?? knownThread?.last_message_at ?? now,
+    first_seen_at: knownThread?.first_seen_at ?? now,
+    last_seen_at: now,
+    raw_text: raw.bodyText
+  };
+
+  return { thread, messages };
+}
+
 function normalizeFacebookUrl(rawUrl: string): string {
   const url = new URL(rawUrl, "https://www.facebook.com");
   return `${url.origin}${url.pathname}`;
@@ -468,6 +750,55 @@ function normalizeFacebookUrl(rawUrl: string): string {
 function listingIdFromUrl(url: string): string | null {
   const match = url.match(/\/marketplace\/item\/(\d+)/i);
   return match ? `fb_${match[1]}` : null;
+}
+
+function threadIdFromUrl(url: string): string | null {
+  const decodedUrl = decodeURIComponent(url);
+  const pathMatch = decodedUrl.match(/\/messages\/t\/([^/?#]+)/i);
+  if (pathMatch) {
+    return `thread_${sanitizeId(pathMatch[1])}`;
+  }
+
+  const tidMatch = decodedUrl.match(/[?&](?:tid|thread_id)=([^&#]+)/i);
+  if (tidMatch) {
+    return `thread_${sanitizeId(tidMatch[1])}`;
+  }
+
+  const inboxMatch = decodedUrl.match(/\/marketplace\/inbox\/([^/?#]+)/i);
+  if (inboxMatch) {
+    return `thread_${sanitizeId(inboxMatch[1])}`;
+  }
+
+  return null;
+}
+
+function normalizeThreadId(input: string): string {
+  const fromUrl = threadIdFromUrl(input);
+  if (fromUrl) {
+    return fromUrl;
+  }
+  if (input.startsWith("thread_")) {
+    return input;
+  }
+  return `thread_${sanitizeId(input)}`;
+}
+
+function threadUrlFromInput(input: string): string {
+  if (/^https?:\/\//i.test(input) || input.startsWith("data:")) {
+    return input;
+  }
+
+  throw new Error(
+    `Unknown thread_id ${input}. Run check_marketplace_messages first or pass a Messenger thread URL.`
+  );
+}
+
+function makeFallbackThreadId(url: string, text: string): string {
+  return makeMessageId(["thread", url, text]).replace(/^msg_/, "thread_");
+}
+
+function sanitizeId(value: string): string {
+  return value.replace(/[^a-z0-9_.:-]+/gi, "_").replace(/^_+|_+$/g, "");
 }
 
 function detailUrlFromListingId(listingId: string): string {
@@ -485,6 +816,175 @@ function splitTextLines(text: string): string[] {
     .split(/\n+/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function parseThreadPreview(
+  text: string,
+  listings: ListingRecord[],
+  now: string
+): {
+  buyerName: string;
+  listing: ListingRecord | undefined;
+  lastMessageText: string;
+  lastMessageRole: MessageRole;
+  lastMessageAt: string;
+} {
+  const lines = splitTextLines(text);
+  const listing = listings.find((candidate) =>
+    text.toLowerCase().includes(candidate.title.toLowerCase())
+  );
+  const timestamp = parseMessageTimestamp(text, now);
+  const messageLine = [...lines]
+    .reverse()
+    .find((line) => isLikelyMessageLine(line, listing?.title));
+  const buyerLine = lines.find(
+    (line) =>
+      line !== listing?.title &&
+      line !== messageLine &&
+      !isTimestampLike(line) &&
+      !/^(marketplace|facebook|messenger|you sent|active now)$/i.test(line)
+  );
+  const { role, text: messageText } = parseRolePrefix(messageLine ?? "");
+
+  return {
+    buyerName: buyerLine ?? "Unknown buyer",
+    listing,
+    lastMessageText: messageText,
+    lastMessageRole: role,
+    lastMessageAt: timestamp
+  };
+}
+
+function parseStructuredOrTextMessages(
+  structuredMessages: Array<{ role: string; timestamp: string; text: string }>,
+  bodyText: string,
+  buyerName: string,
+  now: string
+): Array<{ role: MessageRole; text: string; timestamp: string }> {
+  const structured = structuredMessages
+    .map((message) => ({
+      role: normalizeMessageRole(message.role),
+      text: cleanMessageText(message.text),
+      timestamp: normalizeTimestamp(message.timestamp, now)
+    }))
+    .filter((message) => message.text.length > 0);
+
+  if (structured.length > 0) {
+    return structured;
+  }
+
+  return splitTextLines(bodyText)
+    .map((line) => {
+      const parsed = parseRolePrefix(line, buyerName);
+      return {
+        role: parsed.role,
+        text: parsed.text,
+        timestamp: parseMessageTimestamp(line, now)
+      };
+    })
+    .filter(
+      (message) =>
+        message.text.length > 0 &&
+        message.role !== "unknown" &&
+        !isTimestampLike(message.text)
+    );
+}
+
+function parseRolePrefix(
+  line: string,
+  buyerName = "Unknown buyer"
+): { role: MessageRole; text: string } {
+  const trimmed = line.trim();
+  const match = trimmed.match(/^([^:：]{1,40})[:：]\s*(.+)$/);
+  if (!match) {
+    return {
+      role: "buyer",
+      text: cleanMessageText(trimmed)
+    };
+  }
+
+  const speaker = match[1].trim();
+  const text = cleanMessageText(match[2]);
+  if (/^(you|me|seller|saber)$/i.test(speaker)) {
+    return { role: "seller", text };
+  }
+  if (speaker.toLowerCase() === buyerName.toLowerCase() || !/^(system|facebook)$/i.test(speaker)) {
+    return { role: "buyer", text };
+  }
+  return { role: "system", text };
+}
+
+function normalizeMessageRole(role: string): MessageRole {
+  if (/^(seller|you|me)$/i.test(role)) {
+    return "seller";
+  }
+  if (/^buyer$/i.test(role)) {
+    return "buyer";
+  }
+  if (/^system$/i.test(role)) {
+    return "system";
+  }
+  return "unknown";
+}
+
+function cleanMessageText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function isLikelyMessageLine(line: string, listingTitle: string | undefined): boolean {
+  if (!line || line === listingTitle || isTimestampLike(line)) {
+    return false;
+  }
+  return (
+    /[?？.!。]$/.test(line) ||
+    /^(you|me|seller|buyer|[^:：]{1,40})[:：]\s+/.test(line) ||
+    line.split(/\s+/).length >= 3
+  );
+}
+
+function parseMessageTimestamp(text: string, now: string): string {
+  const isoMatch = text.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?(?:Z|[+-]\d{2}:\d{2})?/);
+  if (isoMatch) {
+    return normalizeTimestamp(isoMatch[0], now);
+  }
+
+  const relativeMatch = text.match(/\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hour|hours|d|day|days)\b/i);
+  if (relativeMatch) {
+    const amount = Number(relativeMatch[1]);
+    const unit = relativeMatch[2].toLowerCase();
+    const date = new Date(now);
+    if (unit.startsWith("m")) {
+      date.setMinutes(date.getMinutes() - amount);
+    } else if (unit.startsWith("h")) {
+      date.setHours(date.getHours() - amount);
+    } else {
+      date.setDate(date.getDate() - amount);
+    }
+    return date.toISOString();
+  }
+
+  if (/\b(just now|now)\b/i.test(text)) {
+    return now;
+  }
+
+  return now;
+}
+
+function normalizeTimestamp(value: string, fallback: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
+}
+
+function isTimestampLike(line: string): boolean {
+  return (
+    /\d{4}-\d{2}-\d{2}T/.test(line) ||
+    /\b(\d+\s*(m|min|mins|minute|minutes|h|hr|hour|hours|d|day|days)|now|just now)\b/i.test(line)
+  );
+}
+
+function cleanThreadTitle(value: string): string | null {
+  const cleaned = cleanTitle(value);
+  return cleaned.length > 0 ? cleaned : null;
 }
 
 function pickListingTitle(lines: string[]): string {

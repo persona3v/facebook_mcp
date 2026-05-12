@@ -61,17 +61,80 @@ export interface ListingDetailResult extends ListingRecord {
   notes: string[];
 }
 
+export type MessageRole = "buyer" | "seller" | "system" | "unknown";
+export type MessageThreadStatus = "open" | "archived" | "unknown";
+
+export interface MarketplaceMessageRecord {
+  message_id: string;
+  thread_id: string;
+  listing_id: string | null;
+  buyer_name: string;
+  role: MessageRole;
+  text: string;
+  timestamp: string;
+  first_seen_at: string;
+  seen_at: string;
+  requires_response: boolean;
+  raw_text?: string;
+}
+
+export interface MessageThreadRecord {
+  thread_id: string;
+  listing_id: string | null;
+  buyer_name: string;
+  listing_title: string | null;
+  status: MessageThreadStatus;
+  url: string;
+  last_message_at: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  raw_text?: string;
+}
+
+export interface MarketplaceMessageNotification {
+  thread_id: string;
+  listing_id: string | null;
+  buyer_name: string;
+  message: string;
+  received_at: string;
+  requires_response: boolean;
+}
+
+export interface CheckMarketplaceMessagesResult {
+  new_messages: MarketplaceMessageNotification[];
+  checked_at: string;
+  screenshot_path: string;
+  browser_state: "marketplace_messages_screen";
+  notes: string[];
+}
+
+export interface GetMessageThreadResult {
+  thread_id: string;
+  listing_id: string | null;
+  buyer_name: string;
+  messages: Array<{
+    role: MessageRole;
+    text: string;
+    timestamp: string;
+  }>;
+  screenshot_path: string;
+  browser_state: "message_thread_screen";
+  notes: string[];
+}
+
 export interface RuntimeConfig {
   dataDir: string;
   draftsDir: string;
   photosDir: string;
   screenshotsDir: string;
   logsDir: string;
+  messagesDbPath: string;
   browserUserDataDir: string;
   browserChannel?: string;
   chromeProfileName?: string;
   marketplaceCreateUrl: string;
   marketplaceSellingUrl: string;
+  marketplaceMessagesUrl: string;
   defaultLocation?: string;
   headless: boolean;
   slowMoMs: number;

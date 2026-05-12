@@ -4,11 +4,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import {
+  checkMarketplaceMessages,
   closeBrowserContext,
   fillListingForm,
+  getMessageThread,
   getListingDetail,
   listMyListings
 } from "./facebook.js";
+import { ensureMessageStore } from "./messageStore.js";
 import {
   assertReadableFiles,
   ensureStorage,
@@ -42,6 +45,17 @@ const listMyListingsSchema = {
 
 const getListingDetailSchema = {
   listing_id: z.string().min(1)
+};
+
+const checkMarketplaceMessagesSchema = {
+  since: z.string().min(1).default("last_check"),
+  include_read: z.boolean().default(false),
+  max_threads: z.number().int().min(1).max(100).default(20),
+  max_scrolls: z.number().int().min(0).max(10).default(3)
+};
+
+const getMessageThreadSchema = {
+  thread_id: z.string().min(1)
 };
 
 const server = new McpServer({
@@ -152,6 +166,39 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "check_marketplace_messages",
+  {
+    title: "Check Facebook Marketplace messages",
+    description:
+      "Open the Marketplace/Messenger inbox, scrape visible threads, store them locally, and return newly seen buyer messages.",
+    inputSchema: checkMarketplaceMessagesSchema
+  },
+  async (input) => {
+    const result = await checkMarketplaceMessages(config, {
+      since: input.since,
+      includeRead: input.include_read,
+      maxThreads: input.max_threads,
+      maxScrolls: input.max_scrolls
+    });
+    return jsonResult(result);
+  }
+);
+
+server.registerTool(
+  "get_message_thread",
+  {
+    title: "Get Facebook Marketplace message thread",
+    description:
+      "Open a saved Marketplace/Messenger thread, scrape visible messages, and update local message memory.",
+    inputSchema: getMessageThreadSchema
+  },
+  async (input) => {
+    const result = await getMessageThread(config, input.thread_id);
+    return jsonResult(result);
+  }
+);
+
 function assertStopBeforePublish(stopBeforePublish: boolean): void {
   if (!stopBeforePublish) {
     throw new Error(
@@ -174,6 +221,7 @@ function jsonResult(value: object) {
 
 async function main(): Promise<void> {
   await ensureStorage(config);
+  await ensureMessageStore(config);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
