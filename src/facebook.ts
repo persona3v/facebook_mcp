@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
 import type {
   CheckMarketplaceMessagesResult,
+  DraftReplyResult,
   FillListingResult,
   GetMessageThreadResult,
   ListingDetailResult,
@@ -12,6 +13,8 @@ import type {
   ListingDraft,
   MarketplaceMessageRecord,
   MessageRole,
+  ReplyConstraints,
+  SendReplyResult,
   MessageThreadRecord,
   RuntimeConfig
 } from "./types.js";
@@ -27,9 +30,11 @@ import {
   findMessageThread,
   loadMessageThread,
   makeMessageId,
+  recordSentReply,
   syncMessageThreads,
   upsertMessageThread
 } from "./messageStore.js";
+import { classifyReplyRisk, draftReply } from "./reply.js";
 
 const SHORT_TIMEOUT_MS = 3000;
 const FIELD_TIMEOUT_MS = 8000;
@@ -320,6 +325,115 @@ export async function getMessageThread(
   };
 }
 
+export async function draftReplyForThread(
+  config: RuntimeConfig,
+  input: {
+    threadId: string;
+    intent: string;
+    constraints: ReplyConstraints;
+  }
+): Promise<DraftReplyResult> {
+  const resolvedThreadId = normalizeThreadId(input.threadId);
+  const saved = await loadMessageThread(config, resolvedThreadId);
+  if (!saved) {
+    throw new Error(
+      `Message thread ${input.threadId} is not saved. Run check_marketplace_messages or get_message_thread first.`
+    );
+  }
+
+  const replyDraft = draftReply({
+    thread: saved.thread,
+    messages: saved.messages,
+    intent: input.intent,
+    constraints: input.constraints
+  });
+  const risk = classifyReplyRisk(replyDraft, input.constraints);
+  const notes: string[] = [];
+  if (saved.messages.length === 0) {
+    notes.push("No saved messages were found for this thread; generated a generic reply.");
+  }
+
+  return {
+    thread_id: saved.thread.thread_id,
+    listing_id: saved.thread.listing_id,
+    buyer_name: saved.thread.buyer_name,
+    reply_draft: replyDraft,
+    risk_level: risk.level,
+    requires_human_approval: true,
+    risk_reasons: risk.reasons,
+    notes
+  };
+}
+
+export async function sendReply(
+  config: RuntimeConfig,
+  input: {
+    threadId: string;
+    message: string;
+    approvalToken: string;
+  }
+): Promise<SendReplyResult> {
+  assertApprovalToken(input.approvalToken);
+
+  const context = await getOrLaunchContext(config);
+  const notes: string[] = [];
+  const knownThread = await findMessageThread(config, normalizeThreadId(input.threadId));
+  const resolvedThreadId = knownThread?.thread_id ?? normalizeThreadId(input.threadId);
+  const url = knownThread?.url ?? threadUrlFromInput(input.threadId);
+  const page = await getWorkingPage(context);
+
+  await page.goto(url, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
+    notes.push("Facebook did not reach networkidle; continuing with visible message composer.");
+  });
+
+  const inventory = await loadInventory(config);
+  const scraped = await scrapeMessageThreadPage(
+    page,
+    inventory.listings,
+    knownThread ?? undefined,
+    resolvedThreadId,
+    url
+  );
+  await upsertMessageThread(config, scraped.thread, scraped.messages);
+
+  const risk = classifyReplyRisk(input.message);
+  const sendMethod = await fillAndSendMessage(page, input.message);
+  notes.push(`Sent reply using ${sendMethod}.`);
+  if (risk.level === "high") {
+    notes.push("Reply was high risk; sending was allowed only because an approval token was supplied.");
+  }
+
+  const sentAt = new Date().toISOString();
+  await recordSentReply(config, {
+    thread: scraped.thread,
+    message: input.message,
+    sentAt,
+    approvalToken: input.approvalToken,
+    riskLevel: risk.level
+  });
+
+  const screenshotPath = await makeScreenshotPath(config, `${scraped.thread.thread_id}_sent`);
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+
+  return {
+    status: "sent",
+    thread_id: scraped.thread.thread_id,
+    listing_id: scraped.thread.listing_id,
+    buyer_name: scraped.thread.buyer_name,
+    message: input.message,
+    risk_level: risk.level,
+    sent_at: sentAt,
+    screenshot_path: screenshotPath,
+    browser_state: "message_thread_screen",
+    notes
+  };
+}
+
 async function getOrLaunchContext(config: RuntimeConfig): Promise<BrowserContext> {
   if (activeContext) {
     return activeContext;
@@ -473,6 +587,60 @@ async function firstUsableLocator(
     }
   }
   return undefined;
+}
+
+async function fillAndSendMessage(page: Page, message: string): Promise<string> {
+  const composer = await firstUsableLocator(page, [
+    '[role="textbox"][contenteditable="true"][aria-label*="Message" i]',
+    '[role="textbox"][contenteditable="true"][aria-label*="Type a message" i]',
+    '[contenteditable="true"][aria-label*="Message" i]',
+    '[contenteditable="true"][data-lexical-editor="true"]',
+    '[role="textbox"][contenteditable="true"]'
+  ]);
+  if (!composer) {
+    throw new Error("Could not find a visible Facebook Messenger message composer.");
+  }
+
+  await composer.scrollIntoViewIfNeeded({ timeout: FIELD_TIMEOUT_MS }).catch(() => undefined);
+  await composer.click({ timeout: FIELD_TIMEOUT_MS });
+  await composer.fill(message, { timeout: FIELD_TIMEOUT_MS }).catch(async () => {
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+    await page.keyboard.press("Backspace");
+    await page.keyboard.insertText(message);
+  });
+  await page.waitForTimeout(500);
+
+  const sendButtons = [
+    page.getByRole("button", { name: /^send$/i }).last(),
+    page.getByRole("button", { name: /press enter to send/i }).last(),
+    page.locator('[aria-label*="Send" i][role="button"]').last(),
+    page.locator('[aria-label*="Press Enter to send" i]').last()
+  ];
+
+  for (const button of sendButtons) {
+    if (
+      (await button.isVisible({ timeout: SHORT_TIMEOUT_MS }).catch(() => false)) &&
+      (await button.isEnabled({ timeout: SHORT_TIMEOUT_MS }).catch(() => false))
+    ) {
+      await button.click({ timeout: FIELD_TIMEOUT_MS });
+      await page.waitForTimeout(1000);
+      return "send button";
+    }
+  }
+
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(1000);
+  return "Enter key fallback";
+}
+
+function assertApprovalToken(approvalToken: string): void {
+  const trimmed = approvalToken.trim();
+  if (
+    trimmed.length < 8 ||
+    /^(none|null|false|auto|automatic|test|placeholder)$/i.test(trimmed)
+  ) {
+    throw new Error("send_reply requires a real human approval token.");
+  }
 }
 
 async function makeScreenshotPath(

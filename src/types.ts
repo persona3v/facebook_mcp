@@ -122,6 +122,34 @@ export interface GetMessageThreadResult {
   notes: string[];
 }
 
+export type ReplyRiskLevel = "low" | "medium" | "high";
+
+export type ReplyConstraints = Record<string, unknown>;
+
+export interface DraftReplyResult {
+  thread_id: string;
+  listing_id: string | null;
+  buyer_name: string;
+  reply_draft: string;
+  risk_level: ReplyRiskLevel;
+  requires_human_approval: true;
+  risk_reasons: string[];
+  notes: string[];
+}
+
+export interface SendReplyResult {
+  status: "sent";
+  thread_id: string;
+  listing_id: string | null;
+  buyer_name: string;
+  message: string;
+  risk_level: ReplyRiskLevel;
+  sent_at: string;
+  screenshot_path: string;
+  browser_state: "message_thread_screen";
+  notes: string[];
+}
+
 export interface RuntimeConfig {
   dataDir: string;
   draftsDir: string;
