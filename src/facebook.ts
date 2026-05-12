@@ -1,12 +1,32 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
-import type { FillListingResult, ListingDraft, RuntimeConfig } from "./types.js";
-import { updateDraft } from "./storage.js";
+import type {
+  FillListingResult,
+  ListingDetailResult,
+  ListingRecord,
+  ListingStatus,
+  ListMyListingsResult,
+  ListingDraft,
+  RuntimeConfig
+} from "./types.js";
+import {
+  findListingRecord,
+  normalizeListingId,
+  syncListingRecords,
+  updateDraft,
+  upsertListingRecord
+} from "./storage.js";
 
 const SHORT_TIMEOUT_MS = 3000;
 const FIELD_TIMEOUT_MS = 8000;
 let activeContext: BrowserContext | undefined;
+
+export async function closeBrowserContext(): Promise<void> {
+  const context = activeContext;
+  activeContext = undefined;
+  await context?.close().catch(() => undefined);
+}
 
 export async function fillListingForm(
   config: RuntimeConfig,
@@ -74,6 +94,114 @@ export async function fillListingForm(
     }
     throw error;
   }
+}
+
+export async function listMyListings(
+  config: RuntimeConfig,
+  options: { maxScrolls: number }
+): Promise<ListMyListingsResult> {
+  const context = await getOrLaunchContext(config);
+  const notes: string[] = [];
+  const page = await getWorkingPage(context);
+
+  await page.goto(config.marketplaceSellingUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
+    notes.push("Facebook did not reach networkidle; scraping visible seller listings.");
+  });
+
+  await scrollPage(page, options.maxScrolls);
+
+  const scraped = await scrapeVisibleListingCards(page);
+  const now = new Date().toISOString();
+  const listingRecords = scraped.map((listing) => ({
+    listing_id: listing.listing_id,
+    draft_id: null,
+    title: listing.title,
+    price: listing.price,
+    status: listing.status,
+    url: listing.url,
+    description: null,
+    views: null,
+    messages_count: null,
+    first_seen_at: now,
+    last_seen_at: now,
+    updated_at: now,
+    raw_text: listing.raw_text
+  }));
+
+  const syncedListings = await syncListingRecords(config, listingRecords);
+  if (syncedListings.length === 0) {
+    notes.push("No Marketplace item links were found on the seller listings page.");
+  }
+
+  const screenshotPath = await makeScreenshotPath(config, "seller_listings");
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+
+  return {
+    listings: syncedListings,
+    synced_at: now,
+    screenshot_path: screenshotPath,
+    browser_state: "seller_listings_screen",
+    notes
+  };
+}
+
+export async function getListingDetail(
+  config: RuntimeConfig,
+  listingId: string
+): Promise<ListingDetailResult> {
+  const context = await getOrLaunchContext(config);
+  const notes: string[] = [];
+  const knownListing = await findListingRecord(config, listingId);
+  const normalizedId = normalizeListingId(listingId);
+  const page = await getWorkingPage(context);
+  const url = knownListing?.url ?? detailUrlFromListingId(normalizedId);
+
+  await page.goto(url, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
+    notes.push("Facebook did not reach networkidle; scraping visible listing detail.");
+  });
+
+  const scraped = await scrapeListingDetailPage(page);
+  const now = new Date().toISOString();
+  const record: ListingRecord = {
+    listing_id: normalizedId,
+    draft_id: knownListing?.draft_id ?? null,
+    title: scraped.title || knownListing?.title || "Untitled listing",
+    price: scraped.price ?? knownListing?.price ?? null,
+    status: scraped.status,
+    url,
+    description: scraped.description ?? knownListing?.description ?? null,
+    views: scraped.views ?? knownListing?.views ?? null,
+    messages_count: scraped.messages_count ?? knownListing?.messages_count ?? null,
+    first_seen_at: knownListing?.first_seen_at ?? now,
+    last_seen_at: now,
+    updated_at: now,
+    raw_text: scraped.raw_text
+  };
+
+  const savedRecord = await upsertListingRecord(config, record);
+  if (!scraped.description) {
+    notes.push("Could not confidently extract a listing description.");
+  }
+
+  const screenshotPath = await makeScreenshotPath(config, normalizedId);
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+
+  return {
+    ...savedRecord,
+    screenshot_path: screenshotPath,
+    browser_state: "listing_detail_screen",
+    notes
+  };
 }
 
 async function getOrLaunchContext(config: RuntimeConfig): Promise<BrowserContext> {
@@ -238,4 +366,228 @@ async function makeScreenshotPath(
   await fs.mkdir(config.screenshotsDir, { recursive: true, mode: 0o700 });
   const stamp = new Date().toISOString().replace(/[-:.]/g, "").replace("T", "_").slice(0, 15);
   return path.join(config.screenshotsDir, `${basename}_${stamp}.png`);
+}
+
+async function scrollPage(page: Page, maxScrolls: number): Promise<void> {
+  for (let i = 0; i < maxScrolls; i += 1) {
+    await page.mouse.wheel(0, 1200);
+    await page.waitForTimeout(800);
+  }
+}
+
+async function scrapeVisibleListingCards(page: Page): Promise<ListingCardScrape[]> {
+  const rawCards = await page
+    .locator('a[href*="/marketplace/item/"]')
+    .evaluateAll((anchors) => {
+      const records: Array<{ href: string; text: string }> = [];
+
+      for (const anchor of anchors as any[]) {
+        const href = anchor.href || anchor.getAttribute?.("href") || "";
+        let container = anchor;
+
+        for (let depth = 0; depth < 5 && container?.parentElement; depth += 1) {
+          const parent = container.parentElement;
+          const parentText = String(parent.innerText || parent.textContent || "");
+          const itemLinks = parent.querySelectorAll?.('a[href*="/marketplace/item/"]');
+          if (parentText.length > 20 && itemLinks?.length <= 3) {
+            container = parent;
+          }
+        }
+
+        const text = String(container?.innerText || anchor.innerText || "")
+          .replace(/\u00a0/g, " ")
+          .trim();
+        records.push({ href, text });
+      }
+
+      return records;
+    });
+
+  const cardsById = new Map<string, ListingCardScrape>();
+
+  for (const rawCard of rawCards) {
+    const url = normalizeFacebookUrl(rawCard.href);
+    const listingId = listingIdFromUrl(url);
+    if (!listingId || cardsById.has(listingId)) {
+      continue;
+    }
+
+    const lines = splitTextLines(rawCard.text);
+    cardsById.set(listingId, {
+      listing_id: listingId,
+      title: pickListingTitle(lines),
+      price: parsePrice(rawCard.text),
+      status: parseStatus(rawCard.text),
+      url,
+      raw_text: rawCard.text
+    });
+  }
+
+  return [...cardsById.values()];
+}
+
+async function scrapeListingDetailPage(page: Page): Promise<ListingDetailScrape> {
+  const rawDetail = await page.evaluate(() => {
+    const doc = (globalThis as any).document;
+    const meta = (selector: string) =>
+      String(doc.querySelector(selector)?.getAttribute("content") || "");
+
+    return {
+      h1: String(doc.querySelector("h1")?.innerText || ""),
+      ogTitle: meta('meta[property="og:title"]'),
+      ogDescription: meta('meta[property="og:description"]'),
+      bodyText: String(doc.body?.innerText || "")
+    };
+  });
+
+  const combinedText = [
+    rawDetail.h1,
+    rawDetail.ogTitle,
+    rawDetail.ogDescription,
+    rawDetail.bodyText
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return {
+    title: cleanTitle(rawDetail.h1 || rawDetail.ogTitle),
+    price: parsePrice(combinedText),
+    status: parseStatus(combinedText),
+    description: parseDescription(rawDetail.ogDescription, rawDetail.bodyText),
+    views: parseLabeledCount(combinedText, "views?"),
+    messages_count: parseLabeledCount(combinedText, "messages?"),
+    raw_text: rawDetail.bodyText
+  };
+}
+
+function normalizeFacebookUrl(rawUrl: string): string {
+  const url = new URL(rawUrl, "https://www.facebook.com");
+  return `${url.origin}${url.pathname}`;
+}
+
+function listingIdFromUrl(url: string): string | null {
+  const match = url.match(/\/marketplace\/item\/(\d+)/i);
+  return match ? `fb_${match[1]}` : null;
+}
+
+function detailUrlFromListingId(listingId: string): string {
+  const match = listingId.match(/^fb_(\d+)$/);
+  if (!match) {
+    throw new Error(
+      `Unknown listing_id ${listingId}. Run list_my_listings first or pass a Facebook Marketplace item URL.`
+    );
+  }
+  return `https://www.facebook.com/marketplace/item/${match[1]}`;
+}
+
+function splitTextLines(text: string): string[] {
+  return text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function pickListingTitle(lines: string[]): string {
+  const titleLine = lines.find(
+    (line) =>
+      !/^\$?\s*\d/.test(line) &&
+      !/^(active|sold|pending|available|boost|views?|messages?)$/i.test(line)
+  );
+
+  return cleanTitle(titleLine ?? "Untitled listing");
+}
+
+function cleanTitle(value: string): string {
+  return value
+    .replace(/\s*\|\s*Facebook Marketplace\s*$/i, "")
+    .replace(/\s*\|\s*Facebook\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parsePrice(text: string): number | null {
+  const match = text.match(/\$\s*([\d,]+(?:\.\d{1,2})?)/);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number(match[1].replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseStatus(text: string): ListingStatus {
+  if (/\bsold\b/i.test(text)) {
+    return "sold";
+  }
+  if (/\bpending\b/i.test(text)) {
+    return "pending";
+  }
+  if (/\b(active|available)\b/i.test(text)) {
+    return "active";
+  }
+  return "unknown";
+}
+
+function parseDescription(
+  ogDescription: string,
+  bodyText: string
+): string | null {
+  const cleanedOgDescription = cleanDescription(ogDescription);
+  if (cleanedOgDescription) {
+    return cleanedOgDescription;
+  }
+
+  const lines = splitTextLines(bodyText);
+  const start = lines.findIndex((line) =>
+    /^(seller'?s description|description)$/i.test(line)
+  );
+  if (start === -1) {
+    return null;
+  }
+
+  const collected: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^(seller information|details|location|meetup preferences|send seller a message)$/i.test(line)) {
+      break;
+    }
+    collected.push(line);
+  }
+
+  return cleanDescription(collected.join("\n"));
+}
+
+function cleanDescription(value: string): string | null {
+  const cleaned = value
+    .replace(/\s+/g, " ")
+    .replace(/\s*\|\s*Facebook Marketplace\s*$/i, "")
+    .replace(/\s*\|\s*Facebook\s*$/i, "")
+    .trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function parseLabeledCount(text: string, labelPattern: string): number | null {
+  const match = text.match(new RegExp(`(\\d[\\d,]*)\\s+${labelPattern}`, "i"));
+  if (!match) {
+    return null;
+  }
+  const parsed = Number(match[1].replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+interface ListingCardScrape {
+  listing_id: string;
+  title: string;
+  price: number | null;
+  status: ListingStatus;
+  url: string;
+  raw_text: string;
+}
+
+interface ListingDetailScrape {
+  title: string;
+  price: number | null;
+  status: ListingStatus;
+  description: string | null;
+  views: number | null;
+  messages_count: number | null;
+  raw_text: string;
 }
