@@ -2,7 +2,7 @@
 
 Local Phase 1, Phase 2, and Phase 3 MCP server for creating Facebook Marketplace listing drafts, filling the Marketplace listing form, reading seller listings, and monitoring buyer messages through Playwright.
 
-This implementation follows the safety boundary in `facebook-marketplace-assistant-mcp-spec.md`:
+This implementation follows these safety boundaries:
 
 - It never stores a Facebook password.
 - It uses a local persistent browser profile.
