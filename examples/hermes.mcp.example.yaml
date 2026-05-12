@@ -6,7 +6,7 @@ mcp_servers:
     env:
       FB_MARKETPLACE_DATA_DIR: "/Users/saber/.hermes/facebook-marketplace"
       FB_MARKETPLACE_HOME_LOCATION: "Minneapolis, MN"
+      FB_MARKETPLACE_MESSAGES_URL: "https://www.facebook.com/marketplace/inbox"
       FB_HEADLESS: "false"
     timeout: 180
     connect_timeout: 60
-
