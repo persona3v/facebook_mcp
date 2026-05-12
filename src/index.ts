@@ -68,8 +68,8 @@ const draftReplySchema = {
 
 const sendReplySchema = {
   thread_id: z.string().min(1),
-  message: z.string().min(1).max(2000),
-  approval_token: z.string().min(8)
+  message: z.string().trim().min(1).max(2000),
+  approval_token: z.string().trim().min(8)
 };
 
 const server = new McpServer({

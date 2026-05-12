@@ -194,7 +194,7 @@ export async function recordSentReply(
   };
 
   const approvalTokenHash = createHash("sha256")
-    .update(details.approvalToken)
+    .update(details.approvalToken.trim())
     .digest("hex");
 
   db.exec("BEGIN");

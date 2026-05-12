@@ -373,7 +373,8 @@ export async function sendReply(
     approvalToken: string;
   }
 ): Promise<SendReplyResult> {
-  assertApprovalToken(input.approvalToken);
+  const approvalToken = normalizeApprovalToken(input.approvalToken);
+  const message = normalizeReplyMessage(input.message);
 
   const context = await getOrLaunchContext(config);
   const notes: string[] = [];
@@ -401,8 +402,8 @@ export async function sendReply(
   );
   await upsertMessageThread(config, scraped.thread, scraped.messages);
 
-  const risk = classifyReplyRisk(input.message);
-  const sendMethod = await fillAndSendMessage(page, input.message);
+  const risk = classifyReplyRisk(message);
+  const sendMethod = await fillAndSendMessage(page, message);
   notes.push(`Sent reply using ${sendMethod}.`);
   if (risk.level === "high") {
     notes.push("Reply was high risk; sending was allowed only because an approval token was supplied.");
@@ -411,9 +412,9 @@ export async function sendReply(
   const sentAt = new Date().toISOString();
   await recordSentReply(config, {
     thread: scraped.thread,
-    message: input.message,
+    message,
     sentAt,
-    approvalToken: input.approvalToken,
+    approvalToken,
     riskLevel: risk.level
   });
 
@@ -425,7 +426,7 @@ export async function sendReply(
     thread_id: scraped.thread.thread_id,
     listing_id: scraped.thread.listing_id,
     buyer_name: scraped.thread.buyer_name,
-    message: input.message,
+    message,
     risk_level: risk.level,
     sent_at: sentAt,
     screenshot_path: screenshotPath,
@@ -590,50 +591,82 @@ async function firstUsableLocator(
 }
 
 async function fillAndSendMessage(page: Page, message: string): Promise<string> {
+  const composer = await findMessageComposer(page);
+  const visibleMessageCountBefore = await countVisibleText(page, message);
+
+  await composer.scrollIntoViewIfNeeded({ timeout: FIELD_TIMEOUT_MS }).catch(() => undefined);
+  await composer.click({ timeout: FIELD_TIMEOUT_MS });
+  await composer.fill(message, { timeout: FIELD_TIMEOUT_MS }).catch(async () => {
+    await composer.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+    await composer.press("Backspace");
+    await composer.pressSequentially(message);
+  });
+  await page.waitForTimeout(500);
+
+  await composer.press("Enter");
+  await verifySendAccepted(page, composer, message, visibleMessageCountBefore);
+  return "composer Enter key";
+}
+
+async function findMessageComposer(page: Page): Promise<Locator> {
   const composer = await firstUsableLocator(page, [
     '[role="textbox"][contenteditable="true"][aria-label*="Message" i]',
     '[role="textbox"][contenteditable="true"][aria-label*="Type a message" i]',
+    '[role="textbox"][contenteditable="true"][aria-label*="Reply" i]',
     '[contenteditable="true"][aria-label*="Message" i]',
-    '[contenteditable="true"][data-lexical-editor="true"]',
-    '[role="textbox"][contenteditable="true"]'
+    '[contenteditable="true"][aria-label*="Type a message" i]',
+    '[contenteditable="true"][aria-label*="Reply" i]'
   ]);
   if (!composer) {
     throw new Error("Could not find a visible Facebook Messenger message composer.");
   }
 
-  await composer.scrollIntoViewIfNeeded({ timeout: FIELD_TIMEOUT_MS }).catch(() => undefined);
-  await composer.click({ timeout: FIELD_TIMEOUT_MS });
-  await composer.fill(message, { timeout: FIELD_TIMEOUT_MS }).catch(async () => {
-    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
-    await page.keyboard.press("Backspace");
-    await page.keyboard.insertText(message);
-  });
-  await page.waitForTimeout(500);
-
-  const sendButtons = [
-    page.getByRole("button", { name: /^send$/i }).last(),
-    page.getByRole("button", { name: /press enter to send/i }).last(),
-    page.locator('[aria-label*="Send" i][role="button"]').last(),
-    page.locator('[aria-label*="Press Enter to send" i]').last()
-  ];
-
-  for (const button of sendButtons) {
-    if (
-      (await button.isVisible({ timeout: SHORT_TIMEOUT_MS }).catch(() => false)) &&
-      (await button.isEnabled({ timeout: SHORT_TIMEOUT_MS }).catch(() => false))
-    ) {
-      await button.click({ timeout: FIELD_TIMEOUT_MS });
-      await page.waitForTimeout(1000);
-      return "send button";
-    }
-  }
-
-  await page.keyboard.press("Enter");
-  await page.waitForTimeout(1000);
-  return "Enter key fallback";
+  return composer;
 }
 
-function assertApprovalToken(approvalToken: string): void {
+async function verifySendAccepted(
+  page: Page,
+  composer: Locator,
+  message: string,
+  visibleMessageCountBefore: number
+): Promise<void> {
+  await page.waitForTimeout(1000);
+
+  const failureNotice = page
+    .locator([
+      'text=/could not send/i',
+      'text=/failed to send/i',
+      'text=/message not sent/i',
+      'text=/try again/i'
+    ].join(", "))
+    .first();
+  if (await failureNotice.isVisible({ timeout: SHORT_TIMEOUT_MS }).catch(() => false)) {
+    throw new Error("Facebook did not accept the reply; not recording it as sent.");
+  }
+
+  const composerText = await composer.innerText({ timeout: SHORT_TIMEOUT_MS }).catch(() => "");
+  const visibleMessageCountAfter = await countVisibleText(page, message);
+  const composerCleared = cleanMessageText(composerText).length === 0;
+  const visibleMessageAdded = visibleMessageCountAfter > visibleMessageCountBefore;
+
+  if (!composerCleared && !visibleMessageAdded) {
+    throw new Error("Could not verify that Facebook accepted the reply; not recording it as sent.");
+  }
+}
+
+async function countVisibleText(page: Page, text: string): Promise<number> {
+  return page.getByText(text, { exact: true }).count().catch(() => 0);
+}
+
+function normalizeReplyMessage(message: string): string {
+  const trimmed = message.trim();
+  if (trimmed.length === 0) {
+    throw new Error("send_reply requires a non-empty message.");
+  }
+  return trimmed;
+}
+
+function normalizeApprovalToken(approvalToken: string): string {
   const trimmed = approvalToken.trim();
   if (
     trimmed.length < 8 ||
@@ -641,6 +674,7 @@ function assertApprovalToken(approvalToken: string): void {
   ) {
     throw new Error("send_reply requires a real human approval token.");
   }
+  return trimmed;
 }
 
 async function makeScreenshotPath(
