@@ -3,7 +3,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
-import { fillListingForm } from "./facebook.js";
+import {
+  closeBrowserContext,
+  fillListingForm,
+  getListingDetail,
+  listMyListings
+} from "./facebook.js";
 import {
   assertReadableFiles,
   ensureStorage,
@@ -29,6 +34,14 @@ const createListingDraftSchema = {
 const fillListingFormSchema = {
   draft_id: z.string().min(1),
   stop_before_publish: z.boolean().default(true)
+};
+
+const listMyListingsSchema = {
+  max_scrolls: z.number().int().min(0).max(10).default(3)
+};
+
+const getListingDetailSchema = {
+  listing_id: z.string().min(1)
 };
 
 const server = new McpServer({
@@ -109,6 +122,36 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "list_my_listings",
+  {
+    title: "List my Facebook Marketplace seller listings",
+    description:
+      "Open the Facebook Marketplace seller listings page, scrape visible listings, and sync local inventory.",
+    inputSchema: listMyListingsSchema
+  },
+  async (input) => {
+    const result = await listMyListings(config, {
+      maxScrolls: input.max_scrolls
+    });
+    return jsonResult(result);
+  }
+);
+
+server.registerTool(
+  "get_listing_detail",
+  {
+    title: "Get Facebook Marketplace listing detail",
+    description:
+      "Open a Marketplace listing detail page, scrape visible metadata, and update local inventory.",
+    inputSchema: getListingDetailSchema
+  },
+  async (input) => {
+    const result = await getListingDetail(config, input.listing_id);
+    return jsonResult(result);
+  }
+);
+
 function assertStopBeforePublish(stopBeforePublish: boolean): void {
   if (!stopBeforePublish) {
     throw new Error(
@@ -134,6 +177,26 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
+
+let shuttingDown = false;
+
+async function shutdown(exitCode: number): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  await closeBrowserContext();
+  process.exit(exitCode);
+}
+
+process.once("SIGINT", () => {
+  void shutdown(130);
+});
+
+process.once("SIGTERM", () => {
+  void shutdown(0);
+});
 
 main().catch((error) => {
   console.error(error);

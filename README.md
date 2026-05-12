@@ -1,6 +1,6 @@
 # Facebook Marketplace Assistant MCP
 
-Local Phase 1 MCP server for creating Facebook Marketplace listing drafts and filling the Marketplace listing form through Playwright.
+Local Phase 1 and Phase 2 MCP server for creating Facebook Marketplace listing drafts, filling the Marketplace listing form, and reading seller listings through Playwright.
 
 This implementation follows the safety boundary in `facebook-marketplace-assistant-mcp-spec.md`:
 
@@ -48,6 +48,30 @@ Input:
 
 Reloads an existing local draft and fills the form again.
 
+### `list_my_listings`
+
+Opens the Facebook Marketplace seller listings page, scrapes visible listing cards, syncs local inventory, saves a screenshot, and returns the current visible listings.
+
+Input:
+
+```json
+{
+  "max_scrolls": 3
+}
+```
+
+### `get_listing_detail`
+
+Opens a Marketplace listing detail page by local listing id, Facebook item id, or Marketplace item URL. It scrapes visible detail metadata and updates local inventory.
+
+Input:
+
+```json
+{
+  "listing_id": "fb_123456"
+}
+```
+
 ## Setup
 
 Install dependencies:
@@ -76,6 +100,7 @@ Important variables:
 
 - `FB_MARKETPLACE_DATA_DIR`: local state directory. Default: `~/.hermes/facebook-marketplace`.
 - `FB_MARKETPLACE_HOME_LOCATION`: fallback listing location.
+- `FB_MARKETPLACE_SELLING_URL`: seller listings URL. Default: `https://www.facebook.com/marketplace/you/selling`.
 - `FB_CHROME_USER_DATA_DIR`: browser profile directory. Default: `~/.hermes/facebook-marketplace/browser-profile`.
 - `FB_BROWSER_CHANNEL`: optional browser channel, for example `chrome`.
 - `FB_CHROME_PROFILE_NAME`: optional Chrome profile name when using a Chrome user data directory.
@@ -104,6 +129,7 @@ Default local state:
   screenshots/
   logs/
   browser-profile/
+  inventory.json
 ```
 
 The server creates these directories with restricted permissions when possible.
@@ -112,4 +138,6 @@ The server creates these directories with restricted permissions when possible.
 
 Facebook Marketplace selectors can change. The form filler uses resilient label and placeholder selectors, but some fields may still need manual review if Facebook changes the UI or localizes field names.
 
-This phase does not implement listing sync, message polling, reply drafting, or message sending.
+Phase 2 listing reads depend on Facebook's current web UI. The scraper stores visible listing metadata in `inventory.json`, but some fields may remain `null` when Facebook hides them or changes the layout.
+
+This phase does not implement message polling, reply drafting, message sending, or marking listings sold.

@@ -56,6 +56,9 @@ export function loadConfig(): RuntimeConfig {
     marketplaceCreateUrl:
       optionalEnv("FB_MARKETPLACE_CREATE_URL") ??
       "https://www.facebook.com/marketplace/create/item",
+    marketplaceSellingUrl:
+      optionalEnv("FB_MARKETPLACE_SELLING_URL") ??
+      "https://www.facebook.com/marketplace/you/selling",
     defaultLocation: optionalEnv("FB_MARKETPLACE_HOME_LOCATION"),
     headless: boolEnv("FB_HEADLESS", false),
     slowMoMs: numberEnv("FB_SLOW_MO_MS", 50)

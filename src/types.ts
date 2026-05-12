@@ -23,6 +23,44 @@ export interface FillListingResult {
   notes: string[];
 }
 
+export type ListingStatus = "active" | "sold" | "pending" | "unknown";
+
+export interface ListingRecord {
+  listing_id: string;
+  draft_id: string | null;
+  title: string;
+  price: number | null;
+  status: ListingStatus;
+  url: string;
+  description: string | null;
+  views: number | null;
+  messages_count: number | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  updated_at: string;
+  raw_text?: string;
+}
+
+export interface ListingInventory {
+  version: 1;
+  updated_at: string;
+  listings: ListingRecord[];
+}
+
+export interface ListMyListingsResult {
+  listings: ListingRecord[];
+  synced_at: string;
+  screenshot_path: string;
+  browser_state: "seller_listings_screen";
+  notes: string[];
+}
+
+export interface ListingDetailResult extends ListingRecord {
+  screenshot_path: string;
+  browser_state: "listing_detail_screen";
+  notes: string[];
+}
+
 export interface RuntimeConfig {
   dataDir: string;
   draftsDir: string;
@@ -33,6 +71,7 @@ export interface RuntimeConfig {
   browserChannel?: string;
   chromeProfileName?: string;
   marketplaceCreateUrl: string;
+  marketplaceSellingUrl: string;
   defaultLocation?: string;
   headless: boolean;
   slowMoMs: number;
