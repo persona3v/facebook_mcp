@@ -1,6 +1,6 @@
 # Facebook Marketplace Assistant MCP
 
-Local Phase 1, Phase 2, and Phase 3 MCP server for creating Facebook Marketplace listing drafts, filling the Marketplace listing form, reading seller listings, and monitoring buyer messages through Playwright.
+Local Phase 1, Phase 2, Phase 3, and Phase 4 MCP server for creating Facebook Marketplace listing drafts, filling the Marketplace listing form, reading seller listings, monitoring buyer messages, and sending human-approved replies through Playwright.
 
 This implementation follows these safety boundaries:
 
@@ -8,6 +8,7 @@ This implementation follows these safety boundaries:
 - It uses a local persistent browser profile.
 - It does not bypass login, 2FA, CAPTCHA, or Facebook risk checks.
 - It refuses to publish automatically.
+- It refuses to send buyer replies without a human approval token.
 - It stops with the browser open so the user can review and manually click `Publish`.
 
 ## Tools
@@ -218,4 +219,6 @@ Phase 2 listing reads depend on Facebook's current web UI. The scraper stores vi
 
 Phase 3 message reads depend on Facebook's current Marketplace/Messenger UI. The scraper stores visible message thread metadata in `messages.db`; Hermes should poll `check_marketplace_messages` every 1-3 minutes and send returned `new_messages` to Discord.
 
-This phase does not implement reply drafting, message sending, or marking listings sold.
+Phase 4 reply sending depends on Facebook's current Messenger composer UI. `send_reply` refuses missing or placeholder approval tokens, classifies reply risk, and logs sent replies in `messages.db`.
+
+This phase does not implement marking listings sold.
