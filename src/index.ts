@@ -63,6 +63,170 @@ const server = new McpServer({
   version: "0.1.0"
 });
 
+server.registerPrompt(
+  "create_marketplace_listing_from_notes",
+  {
+    title: "Create Marketplace listing from notes",
+    description:
+      "Turn item notes into a safe Facebook Marketplace draft workflow. Creates a local draft only unless the user explicitly asks to fill the form.",
+    argsSchema: {
+      notes: z.string().min(1).describe("Raw item notes from the user."),
+      target_price: z
+        .string()
+        .optional()
+        .describe("Optional target price or price range from the user."),
+      category: z
+        .string()
+        .optional()
+        .describe("Optional Facebook Marketplace category hint."),
+      condition: z.string().optional().describe("Optional item condition."),
+      pickup_area: z
+        .string()
+        .optional()
+        .describe("Optional general pickup area. Do not include exact address."),
+      photo_paths: z
+        .string()
+        .optional()
+        .describe("Optional newline- or comma-separated absolute local photo paths.")
+    }
+  },
+  async (input) =>
+    userPrompt(
+      "Create a Facebook Marketplace listing draft from user notes.",
+      [
+        "You are preparing a Facebook Marketplace listing through the local MCP server.",
+        "Use the user's notes to produce concise Marketplace-ready fields, then call create_listing_draft if enough information is present.",
+        "Do not publish. Do not click Publish. If the user later asks to fill the form, call fill_listing_form with stop_before_publish=true.",
+        "Ask a short follow-up if required fields are missing: title, price, category, condition, description, or usable photo paths.",
+        "Keep pickup location general and avoid exact addresses, payment instructions, or anything that could increase account risk.",
+        "",
+        "User notes:",
+        input.notes,
+        optionalPromptLine("Target price", input.target_price),
+        optionalPromptLine("Category hint", input.category),
+        optionalPromptLine("Condition hint", input.condition),
+        optionalPromptLine("Pickup area", input.pickup_area),
+        optionalPromptLine("Photo paths", input.photo_paths)
+      ]
+    )
+);
+
+server.registerPrompt(
+  "review_listing_before_publish",
+  {
+    title: "Review listing before publish",
+    description:
+      "Review a draft or filled form before the user manually publishes it. The workflow never publishes automatically.",
+    argsSchema: {
+      draft_id: z.string().min(1).describe("Local draft id to review."),
+      review_focus: z
+        .string()
+        .optional()
+        .describe("Optional focus, such as price, safety, clarity, or photos."),
+      screenshot_path: z
+        .string()
+        .optional()
+        .describe("Optional local screenshot path from a previous fill attempt.")
+    }
+  },
+  async (input) =>
+    userPrompt(
+      "Review a Facebook Marketplace draft before manual publish.",
+      [
+        "Review the draft for Marketplace clarity, pricing consistency, safety, and missing information.",
+        "If the form needs to be opened or refreshed, call resume_listing_draft or fill_listing_form and keep stop_before_publish=true.",
+        "Never publish automatically. Tell the user they must manually review Facebook's final screen and click Publish themselves.",
+        "Flag risky content: exact address, payment app instructions, pressure tactics, policy-sensitive wording, or private buyer data.",
+        "Return a compact review with: ready/not ready, issues, suggested edits, and next safe action.",
+        "",
+        `Draft id: ${input.draft_id}`,
+        optionalPromptLine("Review focus", input.review_focus),
+        optionalPromptLine("Screenshot path", input.screenshot_path)
+      ]
+    )
+);
+
+server.registerPrompt(
+  "triage_marketplace_buyer_messages",
+  {
+    title: "Triage Marketplace buyer messages",
+    description:
+      "Check buyer messages and triage them for safe human-approved follow-up. This prompt does not send replies.",
+    argsSchema: {
+      since: z
+        .string()
+        .min(1)
+        .default("last_check")
+        .describe("Message window to check, usually last_check."),
+      include_read: z
+        .enum(["false", "true"])
+        .default("false")
+        .describe("Whether to include read threads."),
+      max_threads: z
+        .string()
+        .optional()
+        .describe("Optional maximum number of threads to inspect.")
+    }
+  },
+  async (input) =>
+    userPrompt(
+      "Triage Facebook Marketplace buyer messages.",
+      [
+        "Check Marketplace messages with check_marketplace_messages, then summarize only what needs attention.",
+        "Do not send replies. If drafting a response, keep it as a suggestion that requires human approval.",
+        "Classify each new buyer message as low, medium, or high risk.",
+        "Low risk: availability, pickup-only reminders, item dimensions, basic condition.",
+        "Medium risk: price negotiation, holds, delivery, meeting time, phone number, or broad pickup area.",
+        "High risk: payment apps, deposits, exact address, disputes, policy-sensitive content, or anything that should not be automated.",
+        "For each actionable thread, include buyer name, listing reference if available, message summary, risk level, and suggested next action.",
+        "",
+        `Since: ${input.since}`,
+        `Include read: ${input.include_read}`,
+        optionalPromptLine("Max threads", input.max_threads)
+      ]
+    )
+);
+
+server.registerPrompt(
+  "debug_marketplace_login_or_selector_failure",
+  {
+    title: "Debug Marketplace login or selector failure",
+    description:
+      "Guide safe debugging for Facebook login, checkpoint, CAPTCHA, or selector drift failures without requesting passwords or cookies.",
+    argsSchema: {
+      failure_context: z
+        .string()
+        .min(1)
+        .describe("Observed error, tool result, or user description."),
+      last_tool: z
+        .string()
+        .optional()
+        .describe("Optional last MCP tool that failed."),
+      screenshot_path: z
+        .string()
+        .optional()
+        .describe("Optional local screenshot path from the failed run.")
+    }
+  },
+  async (input) =>
+    userPrompt(
+      "Debug a Facebook Marketplace MCP failure safely.",
+      [
+        "Help diagnose the MCP failure using local evidence only.",
+        "Do not ask for the user's Facebook password, session cookie, 2FA code, or uploaded browser profile.",
+        "If Facebook shows login, 2FA, CAPTCHA, checkpoint, or risk review, instruct the user to complete it manually in the opened browser.",
+        "If the browser reached the expected page but automation failed, treat it as possible selector drift and suggest a narrow code inspection path.",
+        "Prefer actionable next steps: retry after manual login, inspect screenshot, verify configured URLs, or update selectors.",
+        "Keep account safety first and avoid bypass language.",
+        "",
+        "Failure context:",
+        input.failure_context,
+        optionalPromptLine("Last tool", input.last_tool),
+        optionalPromptLine("Screenshot path", input.screenshot_path)
+      ]
+    )
+);
+
 server.registerTool(
   "create_listing_draft",
   {
@@ -217,6 +381,25 @@ function jsonResult(value: object) {
     ],
     structuredContent: value as { [x: string]: unknown }
   };
+}
+
+function userPrompt(description: string, lines: Array<string | undefined>) {
+  return {
+    description,
+    messages: [
+      {
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text: lines.filter(Boolean).join("\n")
+        }
+      }
+    ]
+  };
+}
+
+function optionalPromptLine(label: string, value: string | undefined): string | undefined {
+  return value ? `${label}: ${value}` : undefined;
 }
 
 async function main(): Promise<void> {

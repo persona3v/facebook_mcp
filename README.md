@@ -99,6 +99,53 @@ Input:
 }
 ```
 
+## Prompts
+
+The server exposes MCP prompts for safe Hermes workflows. These are prompt templates, not direct actions; they guide Hermes toward the tools above while preserving the manual-review boundaries.
+
+### `create_marketplace_listing_from_notes`
+
+Turns raw item notes into a Marketplace-ready draft workflow. It should call `create_listing_draft` only when the required draft fields are present, and should not open Facebook unless the user explicitly asks for form fill.
+
+Arguments:
+
+- `notes`: raw item notes from the user.
+- `target_price`: optional target price or price range.
+- `category`: optional category hint.
+- `condition`: optional condition hint.
+- `pickup_area`: optional general pickup area, not an exact address.
+- `photo_paths`: optional newline- or comma-separated absolute local photo paths.
+
+### `review_listing_before_publish`
+
+Reviews a local draft or filled form before manual publish. It may use `fill_listing_form` or `resume_listing_draft`, but only with the server's stop-before-publish behavior.
+
+Arguments:
+
+- `draft_id`: local draft id.
+- `review_focus`: optional focus such as price, safety, clarity, or photos.
+- `screenshot_path`: optional local screenshot path from a previous fill attempt.
+
+### `triage_marketplace_buyer_messages`
+
+Checks buyer messages and triages them for human-approved follow-up. It does not send replies.
+
+Arguments:
+
+- `since`: message window to check. Default: `last_check`.
+- `include_read`: `false` or `true`. Default: `false`.
+- `max_threads`: optional maximum number of threads to inspect.
+
+### `debug_marketplace_login_or_selector_failure`
+
+Guides safe debugging for login, checkpoint, CAPTCHA, or selector-drift failures without asking for passwords, 2FA codes, cookies, or browser profile uploads.
+
+Arguments:
+
+- `failure_context`: observed error, tool result, or user description.
+- `last_tool`: optional last MCP tool that failed.
+- `screenshot_path`: optional local screenshot path from the failed run.
+
 ## Setup
 
 Install dependencies:
