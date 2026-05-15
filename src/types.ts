@@ -166,4 +166,5 @@ export interface RuntimeConfig {
   defaultLocation?: string;
   headless: boolean;
   slowMoMs: number;
+  stealth: boolean;
 }

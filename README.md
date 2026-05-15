@@ -181,6 +181,7 @@ Important variables:
 - `FB_BROWSER_CHANNEL`: optional browser channel, for example `chrome`.
 - `FB_CHROME_PROFILE_NAME`: optional Chrome profile name when using a Chrome user data directory.
 - `FB_HEADLESS`: should stay `false` for manual Facebook login/review.
+- `FB_STEALTH`: apply `puppeteer-extra-plugin-stealth` fingerprint patches (`navigator.webdriver`, plugins, languages, WebGL vendor, headless UA, etc.). Default: `true`. Set to `false` only to debug without the stealth shim.
 
 Recommended first run:
 
@@ -189,6 +190,18 @@ Recommended first run:
 3. Log in manually in the opened browser if Facebook asks.
 4. Complete any 2FA or CAPTCHA manually.
 5. Re-run `fill_listing_form` after login if the form was not visible.
+
+## Browser Fingerprint Stealth
+
+The persistent browser context launches through [`playwright-extra`](https://github.com/berstend/puppeteer-extra/tree/master/packages/playwright-extra) with [`puppeteer-extra-plugin-stealth`](https://github.com/berstend/puppeteer-extra/tree/master/packages/puppeteer-extra-plugin-stealth) registered. This suppresses common automation tells (`navigator.webdriver`, empty `navigator.plugins`, `HeadlessChrome` UA, SwiftShader WebGL vendor) that Facebook risk checks fingerprint on. Toggle with `FB_STEALTH=false` to disable.
+
+Verify the patches in your environment:
+
+```bash
+node scripts/test-stealth.mjs
+```
+
+The script launches a throwaway profile (it does not touch your real Marketplace browser profile), probes the fingerprint signals with stealth off and on, and prints a side-by-side diff plus a pass/fail verdict.
 
 ## Hermes Config
 
