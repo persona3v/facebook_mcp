@@ -173,13 +173,20 @@ server.registerPrompt(
         .default("last_check")
         .describe("Message window to check, usually last_check."),
       include_read: z
-        .enum(["false", "true"])
-        .default("false")
+        .preprocess(
+          (v) => (typeof v === "string" ? v.trim().toLowerCase() === "true" : v),
+          z.boolean()
+        )
+        .default(false)
         .describe("Whether to include read threads."),
       max_threads: z
-        .string()
+        .preprocess(
+          (v) =>
+            typeof v === "string" && v.trim() !== "" ? Number(v) : v,
+          z.number().int().min(1).max(100)
+        )
         .optional()
-        .describe("Optional maximum number of threads to inspect.")
+        .describe("Optional maximum number of threads to inspect (1-100).")
     }
   },
   async (input) =>
@@ -448,8 +455,13 @@ function userPrompt(description: string, lines: Array<string | undefined>) {
   };
 }
 
-function optionalPromptLine(label: string, value: string | undefined): string | undefined {
-  return value ? `${label}: ${value}` : undefined;
+function optionalPromptLine(
+  label: string,
+  value: string | number | undefined
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string" && value.length === 0) return undefined;
+  return `${label}: ${value}`;
 }
 
 async function main(): Promise<void> {
