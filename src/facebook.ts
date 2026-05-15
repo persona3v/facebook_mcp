@@ -1,6 +1,8 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
+import { chromium } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import type { BrowserContext, Locator, Page } from "playwright";
 import type {
   CheckMarketplaceMessagesResult,
   DraftReplyResult,
@@ -39,6 +41,15 @@ import { classifyReplyRisk, draftReply } from "./reply.js";
 const SHORT_TIMEOUT_MS = 3000;
 const FIELD_TIMEOUT_MS = 8000;
 let activeContext: BrowserContext | undefined;
+let stealthRegistered = false;
+
+function ensureStealthRegistered(): void {
+  if (stealthRegistered) {
+    return;
+  }
+  chromium.use(StealthPlugin());
+  stealthRegistered = true;
+}
 
 export async function closeBrowserContext(): Promise<void> {
   const context = activeContext;
@@ -443,17 +454,21 @@ async function getOrLaunchContext(config: RuntimeConfig): Promise<BrowserContext
   await fs.mkdir(config.browserUserDataDir, { recursive: true, mode: 0o700 });
   await fs.chmod(config.browserUserDataDir, 0o700).catch(() => undefined);
 
+  if (config.stealth) {
+    ensureStealthRegistered();
+  }
+
   const args = config.chromeProfileName
     ? [`--profile-directory=${config.chromeProfileName}`]
     : [];
 
-  activeContext = await chromium.launchPersistentContext(config.browserUserDataDir, {
+  activeContext = (await chromium.launchPersistentContext(config.browserUserDataDir, {
     channel: config.browserChannel,
     headless: config.headless,
     slowMo: config.slowMoMs,
     viewport: { width: 1440, height: 1000 },
     args
-  });
+  })) as unknown as BrowserContext;
   activeContext.on("close", () => {
     activeContext = undefined;
   });
