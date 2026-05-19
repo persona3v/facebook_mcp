@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import path from "node:path";
-import type { RuntimeConfig } from "./types.js";
+import type { BrowserMode, RuntimeConfig } from "./types.js";
+
+const DEFAULT_CDP_URL = "http://127.0.0.1:9222";
 
 function expandHome(value: string): string {
   if (value === "~") {
@@ -34,6 +36,19 @@ function numberEnv(name: string, defaultValue: number): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : defaultValue;
 }
 
+function browserModeEnv(name: string, defaultValue: BrowserMode): BrowserMode {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    return defaultValue;
+  }
+  if (value === "managed_profile" || value === "existing_cdp") {
+    return value;
+  }
+  throw new Error(
+    `${name} must be either "managed_profile" or "existing_cdp"; received "${value}".`
+  );
+}
+
 export function loadConfig(): RuntimeConfig {
   const dataDir =
     optionalEnv("FB_MARKETPLACE_DATA_DIR") ??
@@ -43,6 +58,7 @@ export function loadConfig(): RuntimeConfig {
     optionalEnv("FB_CHROME_USER_DATA_DIR") ??
     optionalEnv("FB_CHROME_PROFILE_DIR") ??
     path.join(dataDir, "browser-profile");
+  const browserMode = browserModeEnv("FB_BROWSER_MODE", "managed_profile");
 
   return {
     dataDir,
@@ -51,6 +67,8 @@ export function loadConfig(): RuntimeConfig {
     screenshotsDir: path.join(dataDir, "screenshots"),
     logsDir: path.join(dataDir, "logs"),
     messagesDbPath: path.join(dataDir, "messages.db"),
+    browserMode,
+    browserCdpUrl: optionalEnv("FB_BROWSER_CDP_URL") ?? DEFAULT_CDP_URL,
     browserUserDataDir,
     browserChannel: optionalEnv("FB_BROWSER_CHANNEL"),
     chromeProfileName: optionalEnv("FB_CHROME_PROFILE_NAME"),

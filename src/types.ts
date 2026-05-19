@@ -150,6 +150,13 @@ export interface SendReplyResult {
   notes: string[];
 }
 
+export type BrowserMode = "managed_profile" | "existing_cdp";
+
+export interface BrowserConnectionOptions {
+  browserMode?: BrowserMode;
+  browserCdpUrl?: string;
+}
+
 export interface RuntimeConfig {
   dataDir: string;
   draftsDir: string;
@@ -157,6 +164,8 @@ export interface RuntimeConfig {
   screenshotsDir: string;
   logsDir: string;
   messagesDbPath: string;
+  browserMode: BrowserMode;
+  browserCdpUrl: string;
   browserUserDataDir: string;
   browserChannel?: string;
   chromeProfileName?: string;
