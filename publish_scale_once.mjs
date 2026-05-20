@@ -1,12 +1,26 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 
-const draftPath = '/Users/saber/.hermes/facebook-marketplace/drafts/draft_20260514_141057_o9p1.json';
+function expandHome(p) {
+  if (!p) return p;
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+const dataDir = expandHome(process.env.FB_MARKETPLACE_DATA_DIR) ?? path.join(os.homedir(), '.hermes', 'facebook-marketplace');
+const profileDir = expandHome(process.env.FB_CHROME_USER_DATA_DIR) ?? path.join(dataDir, 'browser-profile');
+const screenshotsDir = path.join(dataDir, 'screenshots');
+const draftPath = process.argv[2] ?? expandHome(process.env.FB_DRAFT_PATH);
+if (!draftPath) {
+  console.error('Usage: node publish_scale_once.mjs <draft.json>   (or set FB_DRAFT_PATH)');
+  process.exit(64);
+}
 const draft = JSON.parse(await fs.readFile(draftPath, 'utf8'));
-const screenshotsDir = '/Users/saber/.hermes/facebook-marketplace/screenshots';
 await fs.mkdir(screenshotsDir, { recursive: true });
-const context = await chromium.launchPersistentContext('/Users/saber/.hermes/facebook-marketplace/browser-profile', {
+const context = await chromium.launchPersistentContext(profileDir, {
   headless: false,
   viewport: { width: 1440, height: 1000 }
 });
