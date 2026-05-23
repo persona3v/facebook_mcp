@@ -1,7 +1,11 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
+import { chromium } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import type { Browser, BrowserContext, Locator, Page } from "playwright";
 import type {
+  BrowserConnectionOptions,
+  BrowserMode,
   CheckMarketplaceMessagesResult,
   DraftReplyResult,
   FillListingResult,
@@ -38,19 +42,44 @@ import { classifyReplyRisk, draftReply } from "./reply.js";
 
 const SHORT_TIMEOUT_MS = 3000;
 const FIELD_TIMEOUT_MS = 8000;
-let activeContext: BrowserContext | undefined;
+let stealthRegistered = false;
+
+interface BrowserSession {
+  mode: BrowserMode;
+  cdpUrl?: string;
+  context: BrowserContext;
+  browser?: Browser;
+}
+
+let activeSession: BrowserSession | undefined;
+
+function ensureStealthRegistered(): void {
+  if (stealthRegistered) {
+    return;
+  }
+  chromium.use(StealthPlugin());
+  stealthRegistered = true;
+}
 
 export async function closeBrowserContext(): Promise<void> {
-  const context = activeContext;
-  activeContext = undefined;
-  await context?.close().catch(() => undefined);
+  const session = activeSession;
+  activeSession = undefined;
+  if (!session) {
+    return;
+  }
+  if (session.mode === "existing_cdp") {
+    await session.browser?.close().catch(() => undefined);
+    return;
+  }
+  await session.context.close().catch(() => undefined);
 }
 
 export async function fillListingForm(
   config: RuntimeConfig,
-  draft: ListingDraft
+  draft: ListingDraft,
+  browserOptions?: BrowserConnectionOptions
 ): Promise<FillListingResult> {
-  const context = await getOrLaunchContext(config);
+  const context = await getOrLaunchContext(config, browserOptions);
   const notes: string[] = [];
 
   try {
@@ -116,9 +145,9 @@ export async function fillListingForm(
 
 export async function listMyListings(
   config: RuntimeConfig,
-  options: { maxScrolls: number }
+  options: { maxScrolls: number } & BrowserConnectionOptions
 ): Promise<ListMyListingsResult> {
-  const context = await getOrLaunchContext(config);
+  const context = await getOrLaunchContext(config, options);
   const notes: string[] = [];
   const page = await getWorkingPage(context);
 
@@ -170,9 +199,10 @@ export async function listMyListings(
 
 export async function getListingDetail(
   config: RuntimeConfig,
-  listingId: string
+  listingId: string,
+  browserOptions?: BrowserConnectionOptions
 ): Promise<ListingDetailResult> {
-  const context = await getOrLaunchContext(config);
+  const context = await getOrLaunchContext(config, browserOptions);
   const notes: string[] = [];
   const knownListing = await findListingRecord(config, listingId);
   const normalizedId = normalizeListingId(listingId);
@@ -229,9 +259,9 @@ export async function checkMarketplaceMessages(
     includeRead: boolean;
     maxThreads: number;
     maxScrolls: number;
-  }
+  } & BrowserConnectionOptions
 ): Promise<CheckMarketplaceMessagesResult> {
-  const context = await getOrLaunchContext(config);
+  const context = await getOrLaunchContext(config, options);
   const notes: string[] = [];
   const page = await getWorkingPage(context);
 
@@ -275,9 +305,10 @@ export async function checkMarketplaceMessages(
 
 export async function getMessageThread(
   config: RuntimeConfig,
-  threadId: string
+  threadId: string,
+  browserOptions?: BrowserConnectionOptions
 ): Promise<GetMessageThreadResult> {
-  const context = await getOrLaunchContext(config);
+  const context = await getOrLaunchContext(config, browserOptions);
   const notes: string[] = [];
   const knownThread = await findMessageThread(config, threadId);
   const resolvedThreadId = knownThread?.thread_id ?? normalizeThreadId(threadId);
@@ -371,12 +402,12 @@ export async function sendReply(
     threadId: string;
     message: string;
     approvalToken: string;
-  }
+  } & BrowserConnectionOptions
 ): Promise<SendReplyResult> {
   const approvalToken = normalizeApprovalToken(input.approvalToken);
   const message = normalizeReplyMessage(input.message);
 
-  const context = await getOrLaunchContext(config);
+  const context = await getOrLaunchContext(config, input);
   const notes: string[] = [];
   const knownThread = await findMessageThread(config, normalizeThreadId(input.threadId));
   const resolvedThreadId = knownThread?.thread_id ?? normalizeThreadId(input.threadId);
@@ -435,33 +466,100 @@ export async function sendReply(
   };
 }
 
-async function getOrLaunchContext(config: RuntimeConfig): Promise<BrowserContext> {
-  if (activeContext) {
-    return activeContext;
+async function getOrLaunchContext(
+  config: RuntimeConfig,
+  browserOptions?: BrowserConnectionOptions
+): Promise<BrowserContext> {
+  const mode = browserOptions?.browserMode ?? config.browserMode;
+  const cdpUrl = browserOptions?.browserCdpUrl ?? config.browserCdpUrl;
+  if (
+    activeSession &&
+    activeSession.mode === mode &&
+    (mode !== "existing_cdp" || activeSession.cdpUrl === cdpUrl)
+  ) {
+    return activeSession.context;
+  }
+
+  await closeBrowserContext();
+
+  if (mode === "existing_cdp") {
+    activeSession = await connectExistingBrowserContext(cdpUrl);
+    return activeSession.context;
   }
 
   await fs.mkdir(config.browserUserDataDir, { recursive: true, mode: 0o700 });
   await fs.chmod(config.browserUserDataDir, 0o700).catch(() => undefined);
 
+  if (config.stealth) {
+    ensureStealthRegistered();
+  }
+
   const args = config.chromeProfileName
     ? [`--profile-directory=${config.chromeProfileName}`]
     : [];
 
-  activeContext = await chromium.launchPersistentContext(config.browserUserDataDir, {
+  const context = (await chromium.launchPersistentContext(config.browserUserDataDir, {
     channel: config.browserChannel,
     headless: config.headless,
     slowMo: config.slowMoMs,
     viewport: { width: 1440, height: 1000 },
     args
+  })) as unknown as BrowserContext;
+  activeSession = { mode, context };
+  context.on("close", () => {
+    if (activeSession?.context === context) {
+      activeSession = undefined;
+    }
   });
-  activeContext.on("close", () => {
-    activeContext = undefined;
+  return context;
+}
+
+async function connectExistingBrowserContext(cdpUrl: string): Promise<BrowserSession> {
+  let browser: Browser;
+  try {
+    browser = await chromium.connectOverCDP(cdpUrl);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Could not connect to an existing Chrome browser over CDP at ${cdpUrl}. ` +
+        "Start Chrome with --remote-debugging-port=9222 and log in to Facebook there, " +
+        "or use browser_mode=\"managed_profile\". " +
+        `Original error: ${detail}`
+    );
+  }
+
+  const context = browser.contexts()[0];
+  if (!context) {
+    await browser.close().catch(() => undefined);
+    throw new Error(
+      `Connected to Chrome over CDP at ${cdpUrl}, but no default browser context was available.`
+    );
+  }
+
+  const session: BrowserSession = {
+    mode: "existing_cdp",
+    cdpUrl,
+    context,
+    browser
+  };
+  browser.on("disconnected", () => {
+    if (activeSession?.browser === browser) {
+      activeSession = undefined;
+    }
   });
-  return activeContext;
+  return session;
 }
 
 async function getWorkingPage(context: BrowserContext): Promise<Page> {
-  const existing = context.pages()[0];
+  const pages = context.pages().filter((page) => !page.isClosed());
+  const existing =
+    pages.find((page) => {
+      try {
+        return new URL(page.url()).hostname.endsWith("facebook.com");
+      } catch {
+        return false;
+      }
+    }) ?? pages[0];
   if (existing) {
     return existing;
   }

@@ -21,7 +21,7 @@ import {
   makeDraftId,
   saveDraft
 } from "./storage.js";
-import type { ListingDraft } from "./types.js";
+import type { BrowserConnectionOptions, BrowserMode, ListingDraft } from "./types.js";
 
 const config = loadConfig();
 
@@ -36,28 +36,46 @@ const createListingDraftSchema = {
   tags: z.array(z.string().min(1).max(80)).default([])
 };
 
+const browserConnectionSchema = {
+  browser_mode: z
+    .enum(["managed_profile", "existing_cdp"])
+    .optional()
+    .describe("Override the configured browser mode for this tool call."),
+  browser_cdp_url: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe("CDP endpoint for browser_mode=existing_cdp, for example http://127.0.0.1:9222.")
+};
+
 const fillListingFormSchema = {
   draft_id: z.string().min(1),
-  stop_before_publish: z.boolean().default(true)
+  stop_before_publish: z.boolean().default(true),
+  ...browserConnectionSchema
 };
 
 const listMyListingsSchema = {
-  max_scrolls: z.number().int().min(0).max(10).default(3)
+  max_scrolls: z.number().int().min(0).max(10).default(3),
+  ...browserConnectionSchema
 };
 
 const getListingDetailSchema = {
-  listing_id: z.string().min(1)
+  listing_id: z.string().min(1),
+  ...browserConnectionSchema
 };
 
 const checkMarketplaceMessagesSchema = {
   since: z.string().min(1).default("last_check"),
   include_read: z.boolean().default(false),
   max_threads: z.number().int().min(1).max(100).default(20),
-  max_scrolls: z.number().int().min(0).max(10).default(3)
+  max_scrolls: z.number().int().min(0).max(10).default(3),
+  ...browserConnectionSchema
 };
 
 const getMessageThreadSchema = {
-  thread_id: z.string().min(1)
+  thread_id: z.string().min(1),
+  ...browserConnectionSchema
 };
 
 const draftReplySchema = {
@@ -69,7 +87,8 @@ const draftReplySchema = {
 const sendReplySchema = {
   thread_id: z.string().min(1),
   message: z.string().trim().min(1).max(2000),
-  approval_token: z.string().trim().min(8)
+  approval_token: z.string().trim().min(8),
+  ...browserConnectionSchema
 };
 
 const server = new McpServer({
@@ -298,7 +317,7 @@ server.registerTool(
     assertStopBeforePublish(input.stop_before_publish);
     const draft = await loadDraft(config, input.draft_id);
     await assertReadableFiles(draft.photos);
-    const result = await fillListingForm(config, draft);
+    const result = await fillListingForm(config, draft, browserOptionsFromInput(input));
     return jsonResult(result);
   }
 );
@@ -310,13 +329,14 @@ server.registerTool(
     description:
       "Reload a saved draft and fill the Facebook Marketplace form again, stopping before Publish.",
     inputSchema: {
-      draft_id: z.string().min(1)
+      draft_id: z.string().min(1),
+      ...browserConnectionSchema
     }
   },
   async (input) => {
     const draft = await loadDraft(config, input.draft_id);
     await assertReadableFiles(draft.photos);
-    const result = await fillListingForm(config, draft);
+    const result = await fillListingForm(config, draft, browserOptionsFromInput(input));
     return jsonResult(result);
   }
 );
@@ -331,7 +351,8 @@ server.registerTool(
   },
   async (input) => {
     const result = await listMyListings(config, {
-      maxScrolls: input.max_scrolls
+      maxScrolls: input.max_scrolls,
+      ...browserOptionsFromInput(input)
     });
     return jsonResult(result);
   }
@@ -346,7 +367,11 @@ server.registerTool(
     inputSchema: getListingDetailSchema
   },
   async (input) => {
-    const result = await getListingDetail(config, input.listing_id);
+    const result = await getListingDetail(
+      config,
+      input.listing_id,
+      browserOptionsFromInput(input)
+    );
     return jsonResult(result);
   }
 );
@@ -364,7 +389,8 @@ server.registerTool(
       since: input.since,
       includeRead: input.include_read,
       maxThreads: input.max_threads,
-      maxScrolls: input.max_scrolls
+      maxScrolls: input.max_scrolls,
+      ...browserOptionsFromInput(input)
     });
     return jsonResult(result);
   }
@@ -379,7 +405,7 @@ server.registerTool(
     inputSchema: getMessageThreadSchema
   },
   async (input) => {
-    const result = await getMessageThread(config, input.thread_id);
+    const result = await getMessageThread(config, input.thread_id, browserOptionsFromInput(input));
     return jsonResult(result);
   }
 );
@@ -414,7 +440,8 @@ server.registerTool(
     const result = await sendReply(config, {
       threadId: input.thread_id,
       message: input.message,
-      approvalToken: input.approval_token
+      approvalToken: input.approval_token,
+      ...browserOptionsFromInput(input)
     });
     return jsonResult(result);
   }
@@ -426,6 +453,16 @@ function assertStopBeforePublish(stopBeforePublish: boolean): void {
       "Phase 1 refuses automatic publishing. Call fill_listing_form with stop_before_publish=true."
     );
   }
+}
+
+function browserOptionsFromInput(input: {
+  browser_mode?: BrowserMode;
+  browser_cdp_url?: string;
+}): BrowserConnectionOptions {
+  return {
+    browserMode: input.browser_mode,
+    browserCdpUrl: input.browser_cdp_url
+  };
 }
 
 function jsonResult(value: object) {

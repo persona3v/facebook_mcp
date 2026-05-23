@@ -179,8 +179,11 @@ Important variables:
 - `FB_MARKETPLACE_MESSAGES_URL`: Marketplace/Messenger inbox URL. Default: `https://www.facebook.com/marketplace/inbox`.
 - `FB_CHROME_USER_DATA_DIR`: browser profile directory. Default: `~/.hermes/facebook-marketplace/browser-profile`.
 - `FB_BROWSER_CHANNEL`: optional browser channel, for example `chrome`.
+- `FB_BROWSER_MODE`: `managed_profile` launches the configured local profile; `existing_cdp` connects to an already-open Chrome instance that was started with remote debugging. Default: `managed_profile`.
+- `FB_BROWSER_CDP_URL`: CDP endpoint for `existing_cdp`. Default: `http://127.0.0.1:9222`.
 - `FB_CHROME_PROFILE_NAME`: optional Chrome profile name when using a Chrome user data directory.
 - `FB_HEADLESS`: should stay `false` for manual Facebook login/review.
+- `FB_STEALTH`: apply `puppeteer-extra-plugin-stealth` fingerprint patches (`navigator.webdriver`, plugins, languages, WebGL vendor, headless UA, etc.). Default: `true`. Set to `false` only to debug without the stealth shim.
 
 Recommended first run:
 
@@ -189,6 +192,46 @@ Recommended first run:
 3. Log in manually in the opened browser if Facebook asks.
 4. Complete any 2FA or CAPTCHA manually.
 5. Re-run `fill_listing_form` after login if the form was not visible.
+
+### Directly attach to an already logged-in Chrome
+
+To let the MCP server use a Chrome window you already logged into, start Chrome with a remote debugging port before opening Facebook:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.hermes/facebook-marketplace/cdp-profile"
+```
+
+Then log in to Facebook in that Chrome window and either set:
+
+```bash
+FB_BROWSER_MODE=existing_cdp
+FB_BROWSER_CDP_URL=http://127.0.0.1:9222
+```
+
+or pass these optional fields to any browser-using tool:
+
+```json
+{
+  "browser_mode": "existing_cdp",
+  "browser_cdp_url": "http://127.0.0.1:9222"
+}
+```
+
+Ordinary Chrome windows cannot be attached after the fact; Chrome must be launched with `--remote-debugging-port` first. If CDP connection fails, the tool reports a setup error and does not silently fall back to a separate browser profile.
+
+## Browser Fingerprint Stealth
+
+The persistent browser context launches through [`playwright-extra`](https://github.com/berstend/puppeteer-extra/tree/master/packages/playwright-extra) with [`puppeteer-extra-plugin-stealth`](https://github.com/berstend/puppeteer-extra/tree/master/packages/puppeteer-extra-plugin-stealth) registered. This suppresses common automation tells (`navigator.webdriver`, empty `navigator.plugins`, `HeadlessChrome` UA, SwiftShader WebGL vendor) that Facebook risk checks fingerprint on. Toggle with `FB_STEALTH=false` to disable.
+
+Verify the patches in your environment:
+
+```bash
+node scripts/test-stealth.mjs
+```
+
+The script launches a throwaway profile (it does not touch your real Marketplace browser profile), probes the fingerprint signals with stealth off and on, and prints a side-by-side diff plus a pass/fail verdict.
 
 ## Hermes Config
 
