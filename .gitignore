@@ -4,3 +4,5 @@ node_modules/
 .DS_Store
 *.log
 facebook-marketplace-assistant-mcp-spec.md
+tmp_*
+*_tmp.cjs

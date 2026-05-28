@@ -75,7 +75,7 @@ Input:
 
 ### `check_marketplace_messages`
 
-Opens the configured Facebook Marketplace/Messenger inbox URL, scrapes visible buyer threads, stores them in local SQLite message memory, and returns newly seen buyer messages.
+Opens the configured Facebook Marketplace/Messenger inbox URL, scrapes visible buyer threads, stores them in local SQLite message memory, returns visible thread summaries, and returns newly seen buyer messages.
 
 Input:
 
@@ -97,6 +97,24 @@ Input:
 ```json
 {
   "thread_id": "thread_abc"
+}
+```
+
+### `draft_reply`
+
+Generates a local reply draft for a saved thread and classifies risk. It never sends a message.
+
+### `send_reply`
+
+Opens a saved Marketplace/Messenger thread, sends only the exact human-approved message when an approval token is supplied, and logs the sent reply locally.
+
+Input:
+
+```json
+{
+  "thread_id": "thread_abc",
+  "message": "Yes, it is still available.",
+  "approval_token": "human-approved-2026-05-28"
 }
 ```
 
@@ -136,6 +154,18 @@ Arguments:
 - `since`: message window to check. Default: `last_check`.
 - `include_read`: `false` or `true`. Default: `false`.
 - `max_threads`: optional maximum number of threads to inspect.
+
+### `reply_to_marketplace_buyer_message`
+
+Finds the relevant buyer thread and sends a human-approved reply through the MCP tools only. The prompt explicitly tells agents not to create temporary Playwright, CJS, JS, or JSON probe files in this repository.
+
+Arguments:
+
+- `thread_id`: optional saved thread id from `check_marketplace_messages`.
+- `buyer_name`: optional buyer name hint if the thread id is unknown.
+- `listing_hint`: optional listing title or item hint.
+- `reply_message`: exact reply text the user approved.
+- `approval_token`: human approval token required before `send_reply`.
 
 ### `debug_marketplace_login_or_selector_failure`
 

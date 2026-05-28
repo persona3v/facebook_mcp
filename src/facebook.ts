@@ -42,6 +42,12 @@ import { classifyReplyRisk, draftReply } from "./reply.js";
 
 const SHORT_TIMEOUT_MS = 3000;
 const FIELD_TIMEOUT_MS = 8000;
+const THREAD_LINK_SELECTOR = [
+  'a[href*="/messages/t/"]',
+  'a[href*="messenger.com/t/"]',
+  'a[href*="/marketplace/inbox"]'
+].join(", ");
+const VISIBLE_THREAD_URL_PREFIX = "marketplace-visible-thread:";
 let stealthRegistered = false;
 
 interface BrowserSession {
@@ -284,7 +290,7 @@ export async function checkMarketplaceMessages(
   );
 
   if (scrapedThreads.length === 0) {
-    notes.push("No visible Marketplace/Messenger thread links were found.");
+    notes.push("No visible Marketplace/Messenger thread rows were found.");
   }
 
   const { newMessages, checkedAt } = await syncMessageThreads(config, scrapedThreads, {
@@ -295,6 +301,18 @@ export async function checkMarketplaceMessages(
   await page.screenshot({ path: screenshotPath, fullPage: true });
 
   return {
+    threads: scrapedThreads.map((thread) => {
+      const lastMessage = thread.messages.at(-1);
+      return {
+        thread_id: thread.thread_id,
+        listing_id: thread.listing_id,
+        buyer_name: thread.buyer_name,
+        listing_title: thread.listing_title,
+        last_message: lastMessage?.text ?? null,
+        last_message_at: thread.last_message_at,
+        requires_response: lastMessage?.requires_response ?? false
+      };
+    }),
     new_messages: newMessages,
     checked_at: checkedAt,
     screenshot_path: screenshotPath,
@@ -315,14 +333,7 @@ export async function getMessageThread(
   const url = knownThread?.url ?? threadUrlFromInput(threadId);
   const page = await getWorkingPage(context);
 
-  await page.goto(url, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000
-  });
-
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-    notes.push("Facebook did not reach networkidle; scraping visible message thread.");
-  });
+  await openMessageThreadPage(config, page, url, knownThread ?? undefined, notes);
 
   const inventory = await loadInventory(config);
   const scraped = await scrapeMessageThreadPage(
@@ -414,14 +425,7 @@ export async function sendReply(
   const url = knownThread?.url ?? threadUrlFromInput(input.threadId);
   const page = await getWorkingPage(context);
 
-  await page.goto(url, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000
-  });
-
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-    notes.push("Facebook did not reach networkidle; continuing with visible message composer.");
-  });
+  await openMessageThreadPage(config, page, url, knownThread ?? undefined, notes);
 
   const inventory = await loadInventory(config);
   const scraped = await scrapeMessageThreadPage(
@@ -564,6 +568,100 @@ async function getWorkingPage(context: BrowserContext): Promise<Page> {
     return existing;
   }
   return context.newPage();
+}
+
+async function openMessageThreadPage(
+  config: RuntimeConfig,
+  page: Page,
+  url: string,
+  knownThread: MessageThreadRecord | undefined,
+  notes: string[]
+): Promise<void> {
+  if (isVisibleThreadUrl(url)) {
+    await page.goto(config.marketplaceMessagesUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
+    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
+      notes.push("Facebook did not reach networkidle; selecting a visible inbox row.");
+    });
+
+    const clicked = await clickVisibleMessageThreadRow(page, knownThread, url);
+    if (!clicked) {
+      throw new Error(
+        "Could not find the saved visible Marketplace inbox row. Run check_marketplace_messages again before replying."
+      );
+    }
+
+    notes.push("Opened saved visible Marketplace inbox row.");
+    await page.waitForTimeout(2500);
+    return;
+  }
+
+  await page.goto(url, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
+    notes.push("Facebook did not reach networkidle; continuing with visible message thread.");
+  });
+}
+
+async function clickVisibleMessageThreadRow(
+  page: Page,
+  knownThread: MessageThreadRecord | undefined,
+  url: string
+): Promise<boolean> {
+  const target = {
+    rawText: knownThread?.raw_text ?? visibleThreadTextFromUrl(url),
+    buyerName: knownThread?.buyer_name ?? null,
+    listingTitle: knownThread?.listing_title ?? null
+  };
+
+  return page.evaluate((target) => {
+    const normalize = (value: string | null | undefined) =>
+      String(value || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    const rawText = normalize(target.rawText);
+    const buyerName = normalize(target.buyerName);
+    const listingTitle = normalize(target.listingTitle);
+    const doc = (globalThis as any).document;
+    const buttons = Array.from(doc.querySelectorAll('[role="button"]')) as any[];
+
+    const candidates = buttons
+      .map((button) => ({
+        button,
+        text: normalize(button.innerText || button.textContent)
+      }))
+      .filter((candidate) => candidate.text.length > 0);
+
+    const match =
+      candidates.find(
+        (candidate) =>
+          rawText.length > 0 &&
+          (candidate.text === rawText ||
+            candidate.text.includes(rawText) ||
+            rawText.includes(candidate.text))
+      ) ??
+      candidates.find((candidate) => {
+        if (!buyerName || !candidate.text.startsWith(`${buyerName} ·`)) {
+          return false;
+        }
+        return !listingTitle || candidate.text.includes(listingTitle);
+      });
+
+    if (!match) {
+      return false;
+    }
+
+    match.button.scrollIntoView({ block: "center", inline: "nearest" });
+    match.button.click();
+    return true;
+  }, target);
 }
 
 async function uploadPhotos(
@@ -881,52 +979,61 @@ async function scrapeVisibleMessageThreads(
   listings: ListingRecord[],
   maxThreads: number
 ): Promise<Array<MessageThreadRecord & { messages: MarketplaceMessageRecord[] }>> {
-  const rawThreads = await page
-    .locator(
-      [
-        'a[href*="/messages/t/"]',
-        'a[href*="messenger.com/t/"]',
-        'a[href*="/marketplace/inbox"]'
-      ].join(", ")
-    )
-    .evaluateAll((anchors) => {
-      const records: Array<{ href: string; text: string }> = [];
+  const rawThreads = await page.evaluate((threadLinkSelector) => {
+    const doc = (globalThis as any).document;
+    const records: Array<{ href: string | null; text: string }> = [];
 
-      for (const anchor of anchors as any[]) {
-        const href = anchor.href || anchor.getAttribute?.("href") || "";
-        let container = anchor;
+    const normalize = (value: string | null | undefined) =>
+      String(value || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 
-        for (let depth = 0; depth < 7 && container?.parentElement; depth += 1) {
-          const parent = container.parentElement;
-          const parentText = String(parent.innerText || parent.textContent || "");
-          const threadLinks = parent.querySelectorAll?.(
-            'a[href*="/messages/t/"], a[href*="messenger.com/t/"], a[href*="/marketplace/inbox"]'
-          );
-          if (parentText.length > 20 && threadLinks?.length <= 3) {
-            container = parent;
-          }
+    for (const anchor of Array.from(doc.querySelectorAll(threadLinkSelector)) as any[]) {
+      const href = anchor.href || anchor.getAttribute?.("href") || "";
+      let container = anchor;
+
+      for (let depth = 0; depth < 7 && container?.parentElement; depth += 1) {
+        const parent = container.parentElement;
+        const parentText = String(parent.innerText || parent.textContent || "");
+        const threadLinks = parent.querySelectorAll?.(threadLinkSelector);
+        if (parentText.length > 20 && threadLinks?.length <= 3) {
+          container = parent;
         }
-
-        const text = String(container?.innerText || anchor.innerText || "")
-          .replace(/\u00a0/g, " ")
-          .trim();
-        records.push({ href, text });
       }
 
-      return records;
-    });
+      const text = normalize(container?.innerText || anchor.innerText);
+      records.push({ href, text });
+    }
+
+    for (const button of Array.from(doc.querySelectorAll('[role="button"]')) as any[]) {
+      const text = normalize(button.innerText || button.textContent);
+      if (text.length >= 20) {
+        records.push({ href: null, text });
+      }
+    }
+
+    return records;
+  }, THREAD_LINK_SELECTOR);
 
   const now = new Date().toISOString();
   const byThreadId = new Map<string, MessageThreadRecord & { messages: MarketplaceMessageRecord[] }>();
 
   for (const rawThread of rawThreads) {
-    const url = normalizeFacebookUrl(rawThread.href);
-    const threadId = threadIdFromUrl(url) ?? makeFallbackThreadId(url, rawThread.text);
-    if (byThreadId.has(threadId)) {
+    if (!looksLikeMarketplaceThreadPreview(rawThread.text, listings)) {
       continue;
     }
 
     const parsed = parseThreadPreview(rawThread.text, listings, now);
+    const url = rawThread.href
+      ? normalizeFacebookUrl(rawThread.href)
+      : visibleThreadUrlFromText(rawThread.text);
+    const threadId =
+      threadIdFromUrl(url) ?? makeVisibleThreadId(parsed, rawThread.text);
+    if (byThreadId.has(threadId)) {
+      continue;
+    }
+    const listingId = parsed.listing?.listing_id ?? (rawThread.href ? listingIdFromUrl(url) : null);
     const messageId = makeMessageId([
       threadId,
       parsed.lastMessageRole,
@@ -935,7 +1042,7 @@ async function scrapeVisibleMessageThreads(
     ]);
     const thread: MessageThreadRecord & { messages: MarketplaceMessageRecord[] } = {
       thread_id: threadId,
-      listing_id: parsed.listing?.listing_id ?? listingIdFromUrl(url),
+      listing_id: listingId,
       buyer_name: parsed.buyerName,
       listing_title: parsed.listing?.title ?? null,
       status: "open",
@@ -949,7 +1056,7 @@ async function scrapeVisibleMessageThreads(
             {
               message_id: messageId,
               thread_id: threadId,
-              listing_id: parsed.listing?.listing_id ?? listingIdFromUrl(url),
+              listing_id: listingId,
               buyer_name: parsed.buyerName,
               role: parsed.lastMessageRole,
               text: parsed.lastMessageText,
@@ -1047,6 +1154,26 @@ function normalizeFacebookUrl(rawUrl: string): string {
   return `${url.origin}${url.pathname}`;
 }
 
+function visibleThreadUrlFromText(text: string): string {
+  return `${VISIBLE_THREAD_URL_PREFIX}${encodeURIComponent(cleanMessageText(text).slice(0, 800))}`;
+}
+
+function visibleThreadTextFromUrl(url: string): string {
+  if (!isVisibleThreadUrl(url)) {
+    return "";
+  }
+
+  try {
+    return decodeURIComponent(url.slice(VISIBLE_THREAD_URL_PREFIX.length));
+  } catch {
+    return "";
+  }
+}
+
+function isVisibleThreadUrl(url: string): boolean {
+  return url.startsWith(VISIBLE_THREAD_URL_PREFIX);
+}
+
 function listingIdFromUrl(url: string): string | null {
   const match = url.match(/\/marketplace\/item\/(\d+)/i);
   return match ? `fb_${match[1]}` : null;
@@ -1084,7 +1211,7 @@ function normalizeThreadId(input: string): string {
 }
 
 function threadUrlFromInput(input: string): string {
-  if (/^https?:\/\//i.test(input) || input.startsWith("data:")) {
+  if (/^https?:\/\//i.test(input) || input.startsWith("data:") || isVisibleThreadUrl(input)) {
     return input;
   }
 
@@ -1095,6 +1222,17 @@ function threadUrlFromInput(input: string): string {
 
 function makeFallbackThreadId(url: string, text: string): string {
   return makeMessageId(["thread", url, text]).replace(/^msg_/, "thread_");
+}
+
+function makeVisibleThreadId(
+  parsed: ReturnType<typeof parseThreadPreview>,
+  rawText: string
+): string {
+  const stableParts =
+    parsed.buyerName !== "Unknown buyer" && parsed.listing
+      ? ["thread_visible", parsed.buyerName, parsed.listing.listing_id]
+      : ["thread_visible", rawText];
+  return makeMessageId(stableParts).replace(/^msg_/, "thread_");
 }
 
 function sanitizeId(value: string): string {
@@ -1118,6 +1256,28 @@ function splitTextLines(text: string): string[] {
     .filter(Boolean);
 }
 
+function looksLikeMarketplaceThreadPreview(text: string, listings: ListingRecord[]): boolean {
+  const cleaned = cleanMessageText(text);
+  if (cleaned.length < 20 || cleaned.length > 1200) {
+    return false;
+  }
+
+  if (/^(facebook|home|friends|groups|marketplace|messages|notifications|new message)$/i.test(cleaned)) {
+    return false;
+  }
+
+  if (findListingInText(cleaned, listings)) {
+    return true;
+  }
+
+  return (
+    cleaned.includes(" · ") &&
+    /\b(\d{1,2}:\d{2}\s*(?:AM|PM)|\d+\s*(?:m|min|mins|minute|minutes|h|hr|hour|hours|d|day|days)|just now|yesterday|today)\b/i.test(
+      cleaned
+    )
+  );
+}
+
 function parseThreadPreview(
   text: string,
   listings: ListingRecord[],
@@ -1129,10 +1289,13 @@ function parseThreadPreview(
   lastMessageRole: MessageRole;
   lastMessageAt: string;
 } {
+  const compact = parseCompactThreadPreview(text, listings, now);
+  if (compact) {
+    return compact;
+  }
+
   const lines = splitTextLines(text);
-  const listing = listings.find((candidate) =>
-    text.toLowerCase().includes(candidate.title.toLowerCase())
-  );
+  const listing = findListingInText(text, listings);
   const timestamp = parseMessageTimestamp(text, now);
   const messageLine = [...lines]
     .reverse()
@@ -1153,6 +1316,48 @@ function parseThreadPreview(
     lastMessageRole: role,
     lastMessageAt: timestamp
   };
+}
+
+function parseCompactThreadPreview(
+  text: string,
+  listings: ListingRecord[],
+  now: string
+): ReturnType<typeof parseThreadPreview> | undefined {
+  const normalized = cleanMessageText(text);
+  const match = normalized.match(/^(.{1,80}?)\s+·\s+(.+)$/);
+  if (!match) {
+    return undefined;
+  }
+
+  const buyerName = match[1].trim();
+  const rest = match[2].trim();
+  if (!buyerName || /^(marketplace|facebook|messages|notifications)$/i.test(buyerName)) {
+    return undefined;
+  }
+
+  const listing = findListingInText(rest, listings);
+  let lastMessageText = rest;
+  if (listing) {
+    const listingIndex = rest.toLowerCase().indexOf(listing.title.toLowerCase());
+    if (listingIndex >= 0) {
+      lastMessageText = rest.slice(listingIndex + listing.title.length);
+    }
+  }
+
+  lastMessageText = stripTrailingMessageTimestamp(lastMessageText);
+
+  return {
+    buyerName,
+    listing,
+    lastMessageText,
+    lastMessageRole: lastMessageText ? "buyer" : "unknown",
+    lastMessageAt: parseMessageTimestamp(normalized, now)
+  };
+}
+
+function findListingInText(text: string, listings: ListingRecord[]): ListingRecord | undefined {
+  const lowerText = text.toLowerCase();
+  return listings.find((candidate) => lowerText.includes(candidate.title.toLowerCase()));
 }
 
 function parseStructuredOrTextMessages(
@@ -1231,6 +1436,16 @@ function cleanMessageText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+function stripTrailingMessageTimestamp(text: string): string {
+  return cleanMessageText(text)
+    .replace(/\b\d{1,2}:\d{2}\s*(?:AM|PM)\s*$/i, "")
+    .replace(
+      /\b(?:\d+\s*(?:m|min|mins|minute|minutes|h|hr|hour|hours|d|day|days)\s*(?:ago)?|just now|now|today|yesterday)\s*$/i,
+      ""
+    )
+    .trim();
+}
+
 function isLikelyMessageLine(line: string, listingTitle: string | undefined): boolean {
   if (!line || line === listingTitle || isTimestampLike(line)) {
     return false;
@@ -1263,6 +1478,26 @@ function parseMessageTimestamp(text: string, now: string): string {
     return date.toISOString();
   }
 
+  const clockMatch = text.match(/\b(\d{1,2}):(\d{2})\s*(AM|PM)\b/i);
+  if (clockMatch) {
+    const date = new Date(now);
+    let hours = Number(clockMatch[1]);
+    const minutes = Number(clockMatch[2]);
+    const meridiem = clockMatch[3].toUpperCase();
+    if (meridiem === "PM" && hours < 12) {
+      hours += 12;
+    }
+    if (meridiem === "AM" && hours === 12) {
+      hours = 0;
+    }
+    date.setHours(hours, minutes, 0, 0);
+    const nowDate = new Date(now);
+    if (date.getTime() - nowDate.getTime() > 60 * 60 * 1000) {
+      date.setDate(date.getDate() - 1);
+    }
+    return date.toISOString();
+  }
+
   if (/\b(just now|now)\b/i.test(text)) {
     return now;
   }
@@ -1278,6 +1513,7 @@ function normalizeTimestamp(value: string, fallback: string): string {
 function isTimestampLike(line: string): boolean {
   return (
     /\d{4}-\d{2}-\d{2}T/.test(line) ||
+    /\b\d{1,2}:\d{2}\s*(?:AM|PM)\b/i.test(line) ||
     /\b(\d+\s*(m|min|mins|minute|minutes|h|hr|hour|hours|d|day|days)|now|just now)\b/i.test(line)
   );
 }

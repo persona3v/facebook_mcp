@@ -100,7 +100,18 @@ export interface MarketplaceMessageNotification {
   requires_response: boolean;
 }
 
+export interface MarketplaceMessageThreadSummary {
+  thread_id: string;
+  listing_id: string | null;
+  buyer_name: string;
+  listing_title: string | null;
+  last_message: string | null;
+  last_message_at: string;
+  requires_response: boolean;
+}
+
 export interface CheckMarketplaceMessagesResult {
+  threads: MarketplaceMessageThreadSummary[];
   new_messages: MarketplaceMessageNotification[];
   checked_at: string;
   screenshot_path: string;

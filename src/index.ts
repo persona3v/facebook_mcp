@@ -228,6 +228,49 @@ server.registerPrompt(
 );
 
 server.registerPrompt(
+  "reply_to_marketplace_buyer_message",
+  {
+    title: "Reply to Marketplace buyer message",
+    description:
+      "Find the relevant Marketplace buyer thread and send only a human-approved reply through the MCP tools. Never creates temporary scripts.",
+    argsSchema: {
+      thread_id: z
+        .string()
+        .optional()
+        .describe("Optional saved thread_id from check_marketplace_messages."),
+      buyer_name: z.string().optional().describe("Optional buyer name hint if thread_id is unknown."),
+      listing_hint: z
+        .string()
+        .optional()
+        .describe("Optional listing title or item hint if thread_id is unknown."),
+      reply_message: z.string().min(1).describe("Exact reply text the user wants to send."),
+      approval_token: z
+        .string()
+        .optional()
+        .describe("Human approval token required before send_reply may be called.")
+    }
+  },
+  async (input) =>
+    userPrompt(
+      "Reply to a Facebook Marketplace buyer message through the MCP server.",
+      [
+        "Use only the MCP tools in this server. Do not write or run temporary Playwright, CJS, JS, or JSON probe files in the repository.",
+        "If thread_id is missing, call check_marketplace_messages first and use buyer_name or listing_hint to identify the matching returned thread summary.",
+        "If the returned thread was scraped from a visible inbox row, use its saved thread_id normally; the MCP server handles opening the row.",
+        "Call get_message_thread if conversation context is needed before replying.",
+        "Call send_reply only when approval_token is supplied and the user has approved the exact reply_message.",
+        "If the thread cannot be found or the MCP tool fails, report the failure and ask for guidance instead of creating a local script.",
+        "",
+        optionalPromptLine("Thread id", input.thread_id),
+        optionalPromptLine("Buyer name", input.buyer_name),
+        optionalPromptLine("Listing hint", input.listing_hint),
+        `Reply message: ${input.reply_message}`,
+        optionalPromptLine("Approval token", input.approval_token)
+      ]
+    )
+);
+
+server.registerPrompt(
   "debug_marketplace_login_or_selector_failure",
   {
     title: "Debug Marketplace login or selector failure",
