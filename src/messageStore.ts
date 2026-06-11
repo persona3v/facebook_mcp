@@ -8,6 +8,7 @@ import type {
   RuntimeConfig
 } from "./types.js";
 import { ensureStorage } from "./storage.js";
+import { makeMessageId } from "./parse.js";
 
 const LAST_CHECK_KEY = "last_check_marketplace_messages_at";
 
@@ -275,11 +276,6 @@ export async function recordSentReply(
 
   db.close();
   return message;
-}
-
-export function makeMessageId(parts: string[]): string {
-  const digest = createHash("sha256").update(parts.join("\u001f")).digest("hex").slice(0, 24);
-  return `msg_${digest}`;
 }
 
 async function openMessageDb(config: RuntimeConfig): Promise<DatabaseSync> {
