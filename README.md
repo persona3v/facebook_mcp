@@ -213,6 +213,8 @@ Important variables:
 - `FB_BROWSER_CDP_URL`: CDP endpoint for `existing_cdp`. Default: `http://127.0.0.1:9222`.
 - `FB_CHROME_PROFILE_NAME`: optional Chrome profile name when using a Chrome user data directory.
 - `FB_HEADLESS`: should stay `false` for manual Facebook login/review.
+- `FB_SLOW_MO_MS`: extra delay per Playwright operation in milliseconds. Default: `0`. Raise it only if you want slower, easier-to-watch automation.
+- `FB_SCREENSHOT_FULL_PAGE`: capture full-page screenshots instead of viewport-only. Default: `false`. Full-page captures of long Facebook pages are slower and larger.
 - `FB_STEALTH`: apply `puppeteer-extra-plugin-stealth` fingerprint patches (`navigator.webdriver`, plugins, languages, WebGL vendor, headless UA, etc.). Default: `true`. Set to `false` only to debug without the stealth shim.
 
 Recommended first run:

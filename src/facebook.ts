@@ -42,12 +42,35 @@ import { classifyReplyRisk, draftReply } from "./reply.js";
 
 const SHORT_TIMEOUT_MS = 3000;
 const FIELD_TIMEOUT_MS = 8000;
+const PAGE_READY_TIMEOUT_MS = 10000;
+const SEND_VERIFY_TIMEOUT_MS = 5000;
+const VISIBLE_PROBE_INTERVAL_MS = 150;
 const THREAD_LINK_SELECTOR = [
   'a[href*="/messages/t/"]',
   'a[href*="messenger.com/t/"]',
   'a[href*="/marketplace/inbox"]'
 ].join(", ");
 const VISIBLE_THREAD_URL_PREFIX = "marketplace-visible-thread:";
+const PAGE_SHELL_ANCHOR = '[role="main"]';
+const COMPOSER_SELECTORS = [
+  '[role="textbox"][contenteditable="true"][aria-label*="Message" i]',
+  '[role="textbox"][contenteditable="true"][aria-label*="Type a message" i]',
+  '[role="textbox"][contenteditable="true"][aria-label*="Reply" i]',
+  '[contenteditable="true"][aria-label*="Message" i]',
+  '[contenteditable="true"][aria-label*="Type a message" i]',
+  '[contenteditable="true"][aria-label*="Reply" i]'
+];
+const CREATE_FORM_ANCHORS = [
+  'input[aria-label*="Title" i]',
+  'input[placeholder*="Title" i]',
+  '[role="textbox"][aria-label*="Title" i]',
+  'input[type="file"]',
+  PAGE_SHELL_ANCHOR
+];
+const SELLER_LISTINGS_ANCHORS = ['a[href*="/marketplace/item/"]', PAGE_SHELL_ANCHOR];
+const LISTING_DETAIL_ANCHORS = ["h1", PAGE_SHELL_ANCHOR];
+const MESSAGE_INBOX_ANCHORS = [THREAD_LINK_SELECTOR, PAGE_SHELL_ANCHOR];
+const MESSAGE_THREAD_ANCHORS = [...COMPOSER_SELECTORS, PAGE_SHELL_ANCHOR];
 let stealthRegistered = false;
 
 interface BrowserSession {
@@ -95,9 +118,7 @@ export async function fillListingForm(
       timeout: 60000
     });
 
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-      notes.push("Facebook did not reach networkidle; continuing with visible form fields.");
-    });
+    await waitForPageReady(page, CREATE_FORM_ANCHORS, "Marketplace create form", notes);
 
     await uploadPhotos(page, draft.photos, notes);
     await fillSimpleField(page, "title", draft.title, [
@@ -124,8 +145,7 @@ export async function fillListingForm(
     await fillDescription(page, draft.description, notes);
     await fillLocation(page, draft.location || config.defaultLocation, notes);
 
-    const screenshotPath = await makeScreenshotPath(config, draft.draft_id);
-    await page.screenshot({ path: screenshotPath, fullPage: true });
+    const screenshotPath = await captureScreenshot(config, page, draft.draft_id);
 
     draft.status = "form_filled";
     draft.updated_at = new Date().toISOString();
@@ -141,9 +161,14 @@ export async function fillListingForm(
   } catch (error) {
     const page = context.pages().at(-1);
     if (page) {
-      const screenshotPath = await makeScreenshotPath(config, `${draft.draft_id}_error`);
-      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
-      notes.push(`Error screenshot saved at ${screenshotPath}`);
+      const screenshotPath = await captureScreenshot(
+        config,
+        page,
+        `${draft.draft_id}_error`
+      ).catch(() => undefined);
+      if (screenshotPath) {
+        notes.push(`Error screenshot saved at ${screenshotPath}`);
+      }
     }
     throw error;
   }
@@ -162,9 +187,7 @@ export async function listMyListings(
     timeout: 60000
   });
 
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-    notes.push("Facebook did not reach networkidle; scraping visible seller listings.");
-  });
+  await waitForPageReady(page, SELLER_LISTINGS_ANCHORS, "seller listings page", notes);
 
   await scrollPage(page, options.maxScrolls);
 
@@ -191,8 +214,7 @@ export async function listMyListings(
     notes.push("No Marketplace item links were found on the seller listings page.");
   }
 
-  const screenshotPath = await makeScreenshotPath(config, "seller_listings");
-  await page.screenshot({ path: screenshotPath, fullPage: true });
+  const screenshotPath = await captureScreenshot(config, page, "seller_listings");
 
   return {
     listings: syncedListings,
@@ -220,9 +242,7 @@ export async function getListingDetail(
     timeout: 60000
   });
 
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-    notes.push("Facebook did not reach networkidle; scraping visible listing detail.");
-  });
+  await waitForPageReady(page, LISTING_DETAIL_ANCHORS, "listing detail page", notes);
 
   const scraped = await scrapeListingDetailPage(page);
   const now = new Date().toISOString();
@@ -247,8 +267,7 @@ export async function getListingDetail(
     notes.push("Could not confidently extract a listing description.");
   }
 
-  const screenshotPath = await makeScreenshotPath(config, normalizedId);
-  await page.screenshot({ path: screenshotPath, fullPage: true });
+  const screenshotPath = await captureScreenshot(config, page, normalizedId);
 
   return {
     ...savedRecord,
@@ -276,9 +295,7 @@ export async function checkMarketplaceMessages(
     timeout: 60000
   });
 
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-    notes.push("Facebook did not reach networkidle; scraping visible message threads.");
-  });
+  await waitForPageReady(page, MESSAGE_INBOX_ANCHORS, "Marketplace inbox", notes);
 
   await scrollPage(page, options.maxScrolls);
 
@@ -297,8 +314,7 @@ export async function checkMarketplaceMessages(
     since: options.since,
     includeRead: options.includeRead
   });
-  const screenshotPath = await makeScreenshotPath(config, "marketplace_messages");
-  await page.screenshot({ path: screenshotPath, fullPage: true });
+  const screenshotPath = await captureScreenshot(config, page, "marketplace_messages");
 
   return {
     threads: scrapedThreads.map((thread) => {
@@ -345,8 +361,7 @@ export async function getMessageThread(
   );
   await upsertMessageThread(config, scraped.thread, scraped.messages);
   const saved = await loadMessageThread(config, scraped.thread.thread_id);
-  const screenshotPath = await makeScreenshotPath(config, scraped.thread.thread_id);
-  await page.screenshot({ path: screenshotPath, fullPage: true });
+  const screenshotPath = await captureScreenshot(config, page, scraped.thread.thread_id);
 
   if (!saved) {
     throw new Error(`Message thread ${scraped.thread.thread_id} was not saved.`);
@@ -453,8 +468,11 @@ export async function sendReply(
     riskLevel: risk.level
   });
 
-  const screenshotPath = await makeScreenshotPath(config, `${scraped.thread.thread_id}_sent`);
-  await page.screenshot({ path: screenshotPath, fullPage: true });
+  const screenshotPath = await captureScreenshot(
+    config,
+    page,
+    `${scraped.thread.thread_id}_sent`
+  );
 
   return {
     status: "sent",
@@ -583,9 +601,7 @@ async function openMessageThreadPage(
       timeout: 60000
     });
 
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-      notes.push("Facebook did not reach networkidle; selecting a visible inbox row.");
-    });
+    await waitForPageReady(page, MESSAGE_INBOX_ANCHORS, "Marketplace inbox", notes);
 
     const clicked = await clickVisibleMessageThreadRow(page, knownThread, url);
     if (!clicked) {
@@ -595,7 +611,14 @@ async function openMessageThreadPage(
     }
 
     notes.push("Opened saved visible Marketplace inbox row.");
-    await page.waitForTimeout(2500);
+    const composerReady = await waitForAnyVisible(
+      page,
+      COMPOSER_SELECTORS,
+      FIELD_TIMEOUT_MS
+    );
+    if (!composerReady) {
+      notes.push("Message composer did not appear after opening the inbox row.");
+    }
     return;
   }
 
@@ -604,9 +627,7 @@ async function openMessageThreadPage(
     timeout: 60000
   });
 
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {
-    notes.push("Facebook did not reach networkidle; continuing with visible message thread.");
-  });
+  await waitForPageReady(page, MESSAGE_THREAD_ANCHORS, "message thread", notes);
 }
 
 async function clickVisibleMessageThreadRow(
@@ -686,7 +707,7 @@ async function fillSimpleField(
   value: string,
   selectors: string[]
 ): Promise<void> {
-  const locator = await firstUsableLocator(page, selectors);
+  const locator = await firstUsableLocator(page, selectors, FIELD_TIMEOUT_MS);
   if (!locator) {
     throw new Error(`Could not find Facebook Marketplace ${fieldName} field.`);
   }
@@ -709,11 +730,10 @@ async function chooseDropdownValue(
 
   await trigger.scrollIntoViewIfNeeded({ timeout: FIELD_TIMEOUT_MS }).catch(() => undefined);
   await trigger.click({ timeout: FIELD_TIMEOUT_MS });
-  await page.keyboard.type(value);
-  await page.waitForTimeout(500);
+  await page.keyboard.type(value, { delay: 30 });
 
   const exactOption = page.getByText(value, { exact: true }).last();
-  if (await exactOption.isVisible({ timeout: SHORT_TIMEOUT_MS }).catch(() => false)) {
+  if (await waitForLocatorVisible(exactOption, 1500)) {
     await exactOption.click();
     return;
   }
@@ -769,21 +789,65 @@ async function fillLocation(
 
   await locator.scrollIntoViewIfNeeded({ timeout: FIELD_TIMEOUT_MS }).catch(() => undefined);
   await locator.fill(location, { timeout: FIELD_TIMEOUT_MS });
-  await page.waitForTimeout(500);
+  const suggestion = page.locator('[role="option"]').first();
+  await waitForLocatorVisible(suggestion, 2000);
   await page.keyboard.press("Enter").catch(() => undefined);
 }
 
 async function firstUsableLocator(
   page: Page,
-  selectors: string[]
+  selectors: string[],
+  timeoutMs = SHORT_TIMEOUT_MS
 ): Promise<Locator | undefined> {
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-    if (await locator.isVisible({ timeout: SHORT_TIMEOUT_MS }).catch(() => false)) {
-      return locator;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    for (const selector of selectors) {
+      const locator = page.locator(selector).first();
+      if (await locator.isVisible().catch(() => false)) {
+        return locator;
+      }
     }
+    if (Date.now() >= deadline) {
+      return undefined;
+    }
+    await page.waitForTimeout(VISIBLE_PROBE_INTERVAL_MS);
   }
-  return undefined;
+}
+
+async function waitForAnyVisible(
+  page: Page,
+  selectors: string[],
+  timeoutMs: number
+): Promise<boolean> {
+  return (await firstUsableLocator(page, selectors, timeoutMs)) !== undefined;
+}
+
+async function waitForLocatorVisible(
+  locator: Locator,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await locator.isVisible().catch(() => false)) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await locator.page().waitForTimeout(VISIBLE_PROBE_INTERVAL_MS);
+  }
+}
+
+async function waitForPageReady(
+  page: Page,
+  anchorSelectors: string[],
+  surface: string,
+  notes: string[]
+): Promise<void> {
+  const ready = await waitForAnyVisible(page, anchorSelectors, PAGE_READY_TIMEOUT_MS);
+  if (!ready) {
+    notes.push(`Timed out waiting for the ${surface} to render; continuing with visible content.`);
+  }
 }
 
 async function fillAndSendMessage(page: Page, message: string): Promise<string> {
@@ -795,9 +859,9 @@ async function fillAndSendMessage(page: Page, message: string): Promise<string> 
   await composer.fill(message, { timeout: FIELD_TIMEOUT_MS }).catch(async () => {
     await composer.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
     await composer.press("Backspace");
-    await composer.pressSequentially(message);
+    await composer.pressSequentially(message, { delay: 20 });
   });
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(300);
 
   await composer.press("Enter");
   await verifySendAccepted(page, composer, message, visibleMessageCountBefore);
@@ -805,14 +869,7 @@ async function fillAndSendMessage(page: Page, message: string): Promise<string> 
 }
 
 async function findMessageComposer(page: Page): Promise<Locator> {
-  const composer = await firstUsableLocator(page, [
-    '[role="textbox"][contenteditable="true"][aria-label*="Message" i]',
-    '[role="textbox"][contenteditable="true"][aria-label*="Type a message" i]',
-    '[role="textbox"][contenteditable="true"][aria-label*="Reply" i]',
-    '[contenteditable="true"][aria-label*="Message" i]',
-    '[contenteditable="true"][aria-label*="Type a message" i]',
-    '[contenteditable="true"][aria-label*="Reply" i]'
-  ]);
+  const composer = await firstUsableLocator(page, COMPOSER_SELECTORS, FIELD_TIMEOUT_MS);
   if (!composer) {
     throw new Error("Could not find a visible Facebook Messenger message composer.");
   }
@@ -826,27 +883,28 @@ async function verifySendAccepted(
   message: string,
   visibleMessageCountBefore: number
 ): Promise<void> {
-  await page.waitForTimeout(1000);
-
   const failureNotice = page
-    .locator([
-      'text=/could not send/i',
-      'text=/failed to send/i',
-      'text=/message not sent/i',
-      'text=/try again/i'
-    ].join(", "))
+    .getByText(/could not send|failed to send|message not sent|try again/i)
     .first();
-  if (await failureNotice.isVisible({ timeout: SHORT_TIMEOUT_MS }).catch(() => false)) {
-    throw new Error("Facebook did not accept the reply; not recording it as sent.");
-  }
+  const deadline = Date.now() + SEND_VERIFY_TIMEOUT_MS;
 
-  const composerText = await composer.innerText({ timeout: SHORT_TIMEOUT_MS }).catch(() => "");
-  const visibleMessageCountAfter = await countVisibleText(page, message);
-  const composerCleared = cleanMessageText(composerText).length === 0;
-  const visibleMessageAdded = visibleMessageCountAfter > visibleMessageCountBefore;
+  for (;;) {
+    if (await failureNotice.isVisible().catch(() => false)) {
+      throw new Error("Facebook did not accept the reply; not recording it as sent.");
+    }
 
-  if (!composerCleared && !visibleMessageAdded) {
-    throw new Error("Could not verify that Facebook accepted the reply; not recording it as sent.");
+    const composerText = await composer.innerText({ timeout: SHORT_TIMEOUT_MS }).catch(() => "");
+    const composerCleared = cleanMessageText(composerText).length === 0;
+    const visibleMessageAdded =
+      (await countVisibleText(page, message)) > visibleMessageCountBefore;
+    if (composerCleared || visibleMessageAdded) {
+      return;
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error("Could not verify that Facebook accepted the reply; not recording it as sent.");
+    }
+    await page.waitForTimeout(250);
   }
 }
 
@@ -882,11 +940,36 @@ async function makeScreenshotPath(
   return path.join(config.screenshotsDir, `${basename}_${stamp}.png`);
 }
 
+async function captureScreenshot(
+  config: RuntimeConfig,
+  page: Page,
+  basename: string
+): Promise<string> {
+  const screenshotPath = await makeScreenshotPath(config, basename);
+  await page.screenshot({ path: screenshotPath, fullPage: config.screenshotFullPage });
+  return screenshotPath;
+}
+
 async function scrollPage(page: Page, maxScrolls: number): Promise<void> {
+  let previousTextLength = await visibleTextLength(page);
   for (let i = 0; i < maxScrolls; i += 1) {
     await page.mouse.wheel(0, 1200);
     await page.waitForTimeout(800);
+    const textLength = await visibleTextLength(page);
+    if (textLength <= previousTextLength) {
+      break;
+    }
+    previousTextLength = textLength;
   }
+}
+
+async function visibleTextLength(page: Page): Promise<number> {
+  return page
+    .evaluate(() => {
+      const doc = (globalThis as any).document;
+      return String(doc?.body?.innerText || "").length;
+    })
+    .catch(() => 0);
 }
 
 async function scrapeVisibleListingCards(page: Page): Promise<ListingCardScrape[]> {

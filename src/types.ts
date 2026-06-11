@@ -187,4 +187,5 @@ export interface RuntimeConfig {
   headless: boolean;
   slowMoMs: number;
   stealth: boolean;
+  screenshotFullPage: boolean;
 }

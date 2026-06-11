@@ -83,7 +83,8 @@ export function loadConfig(): RuntimeConfig {
       "https://www.facebook.com/marketplace/inbox",
     defaultLocation: optionalEnv("FB_MARKETPLACE_HOME_LOCATION"),
     headless: boolEnv("FB_HEADLESS", false),
-    slowMoMs: numberEnv("FB_SLOW_MO_MS", 50),
-    stealth: boolEnv("FB_STEALTH", true)
+    slowMoMs: numberEnv("FB_SLOW_MO_MS", 0),
+    stealth: boolEnv("FB_STEALTH", true),
+    screenshotFullPage: boolEnv("FB_SCREENSHOT_FULL_PAGE", false)
   };
 }
