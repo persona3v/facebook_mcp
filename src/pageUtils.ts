@@ -75,15 +75,9 @@ export async function captureScreenshot(
 }
 
 export async function scrollPage(page: Page, maxScrolls: number): Promise<void> {
-  let previousTextLength = await visibleTextLength(page);
   for (let i = 0; i < maxScrolls; i += 1) {
     await page.mouse.wheel(0, 1200);
     await page.waitForTimeout(800);
-    const textLength = await visibleTextLength(page);
-    if (textLength <= previousTextLength) {
-      break;
-    }
-    previousTextLength = textLength;
   }
 }
 
@@ -94,13 +88,4 @@ async function makeScreenshotPath(
   await fs.mkdir(config.screenshotsDir, { recursive: true, mode: 0o700 });
   const stamp = new Date().toISOString().replace(/[-:.]/g, "").replace("T", "_").slice(0, 15);
   return path.join(config.screenshotsDir, `${basename}_${stamp}.png`);
-}
-
-async function visibleTextLength(page: Page): Promise<number> {
-  return page
-    .evaluate(() => {
-      const doc = (globalThis as any).document;
-      return String(doc?.body?.innerText || "").length;
-    })
-    .catch(() => 0);
 }

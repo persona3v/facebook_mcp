@@ -65,13 +65,13 @@ export const CREATE_FORM_ANCHORS = [
   PAGE_SHELL_ANCHOR
 ];
 
-export const SELLER_LISTINGS_ANCHORS = [
-  LISTING_CARD_LINK_SELECTOR,
-  PAGE_SHELL_ANCHOR
-];
+// Scrape surfaces anchor on real content only: a [role="main"] fallback would let
+// scraping start on the bare page shell before rows or details render. The create
+// form keeps the shell fallback because each required field waits separately.
+export const SELLER_LISTINGS_ANCHORS = [LISTING_CARD_LINK_SELECTOR];
 
-export const LISTING_DETAIL_ANCHORS = ["h1", PAGE_SHELL_ANCHOR];
+export const LISTING_DETAIL_ANCHORS = ["h1"];
 
-export const MESSAGE_INBOX_ANCHORS = [THREAD_LINK_SELECTOR, PAGE_SHELL_ANCHOR];
+export const MESSAGE_INBOX_ANCHORS = [THREAD_LINK_SELECTOR];
 
-export const MESSAGE_THREAD_ANCHORS = [...COMPOSER_SELECTORS, PAGE_SHELL_ANCHOR];
+export const MESSAGE_THREAD_ANCHORS = [...COMPOSER_SELECTORS];
