@@ -1,4 +1,4 @@
-export type ListingDraftStatus = "local_draft" | "form_filled";
+export type ListingDraftStatus = "local_draft" | "form_filled" | "published";
 
 export interface ListingDraft {
   draft_id: string;

@@ -74,7 +74,7 @@ export async function fillListingForm(
     );
 
     if (options?.persistStatus !== false) {
-      draft.status = "form_filled";
+      draft.status = published ? "published" : "form_filled";
       draft.updated_at = new Date().toISOString();
       await updateDraft(config, draft);
     }
