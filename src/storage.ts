@@ -1,5 +1,7 @@
 import { constants, promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { withLock } from "./mutex.js";
 import type {
   ListingDraft,
   ListingInventory,
@@ -63,9 +65,18 @@ export async function updateDraft(
   await ensureStorage(config);
   const filePath = draftPath(config, draft.draft_id);
   const body = `${JSON.stringify(draft, null, 2)}\n`;
-  await fs.writeFile(filePath, body, { mode: 0o600 });
-  await fs.chmod(filePath, 0o600).catch(() => undefined);
-  return filePath;
+
+  // Drafts live in a directory shared by every profile, and the per-profile
+  // locks do not exclude each other, so two accounts can update one draft at
+  // once. Serialize on the path and write through a temp file so a concurrent
+  // loadDraft never parses a half-written file.
+  return withLock(`draft:${filePath}`, async () => {
+    const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+    await fs.writeFile(tempPath, body, { mode: 0o600 });
+    await fs.chmod(tempPath, 0o600).catch(() => undefined);
+    await fs.rename(tempPath, filePath);
+    return filePath;
+  });
 }
 
 export async function loadDraft(

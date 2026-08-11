@@ -264,7 +264,11 @@ The server can drive several accounts at once. Create a `profiles.json` (default
 }
 ```
 
-Every field except `id` is optional and falls back to the environment variables above. Per-account overrides: `label`, `data_dir`, `browser_user_data_dir`, `browser_mode`, `browser_cdp_url`, `browser_channel`, `chrome_profile_name`, `home_location`, `headless`.
+Every field except `id` is optional. Per-account overrides: `label`, `data_dir`, `browser_user_data_dir`, `browser_mode`, `browser_cdp_url`, `browser_channel`, `chrome_profile_name`, `home_location`, `headless`.
+
+`browser_mode`, `browser_cdp_url`, `browser_channel`, `chrome_profile_name`, `home_location`, and `headless` fall back to the environment variables above when omitted. `data_dir` and `browser_user_data_dir` do **not** — they default to per-account paths under the data directory, because a global `FB_CHROME_USER_DATA_DIR` shared by every account is exactly the collision the server refuses to start on.
+
+If `FB_PROFILES_FILE` names a path that does not exist, the server fails to start rather than quietly falling back to single-account mode — otherwise a typo would make a broadcast look like it posted to every account when it only used one.
 
 **If this file does not exist, nothing changes** — the server runs as a single account named `default` using exactly the paths it always used.
 
@@ -279,7 +283,9 @@ What is shared and what is separate:
 
 Each account needs its own manual Facebook login once. Run `list_profiles`, then call any browser tool with that `profile` to open its window and log in.
 
-The server refuses to start if two accounts would collide: sharing a `browser_user_data_dir` (Chrome cannot open it twice) or, in `existing_cdp` mode, sharing a CDP endpoint (both accounts would silently drive the same browser).
+The server refuses to start if two accounts would collide: sharing a `data_dir` (their listings and messages would merge), sharing a `browser_user_data_dir` (Chrome cannot open it twice), or, in `existing_cdp` mode, sharing a CDP endpoint (both accounts would silently drive the same browser).
+
+Note that nothing verifies two profiles are really different Facebook accounts. If you copy one `browser-profile/` directory to another, both will post to the same account.
 
 `FB_STEALTH` is global rather than per-account, because the stealth patches are registered once on the shared browser launcher.
 
@@ -305,9 +311,15 @@ To let the server click `Publish`, both of these are required on the same call:
 }
 ```
 
-A missing or placeholder token is refused. The token is only compared, never written to disk or included in results.
+A missing or placeholder token is refused, and the token is never written to disk or included in results. Be aware of what this gate is and is not: it is a deliberate speed bump confirming a human asked for this specific publish, not a cryptographic check — the server has nothing to compare the token against. Treat `stop_before_publish=false` as the dangerous flag it is.
+
+When publishing, `broadcast_listing_draft` additionally **requires an explicit `profiles` list**. It will not fan out an irreversible publish to every configured account by default.
 
 Posting the same item to several accounts in quick succession is exactly the pattern Facebook's spam checks look for. `broadcast_listing_draft` therefore fills every account's form in parallel — that part is ordinary browsing — but serializes the `Publish` clicks with a randomized 5-15 second gap. Set `publish_stagger_ms` for a fixed gap, or `fill_concurrency` to fill fewer accounts at a time.
+
+A publish is only reported as `published` when the browser lands on the new listing or on your seller listings page. If Facebook redirects to a login or security checkpoint the account is reported as failed, and any other destination is reported as `publish_unconfirmed` — check those accounts by hand before retrying, so an item is not posted twice.
+
+Because publishes are serialized, a large broadcast can run for minutes. Raise the `timeout` in your MCP client config (`examples/hermes.mcp.example.yaml` ships with `180`) before broadcasting to many accounts; if the client gives up, the browsers keep working and you lose the result summary.
 
 ## Directly attach to an already logged-in Chrome
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -16,6 +16,7 @@ import { ensureMessageStore } from "./messageStore.js";
 import { withLock } from "./mutex.js";
 import { normalizeApprovalToken } from "./parse.js";
 import { loadProfiles, resolveProfileConfig, summarizeProfiles } from "./profiles.js";
+import type { ProfileRegistry } from "./profiles.js";
 import {
   assertReadableFiles,
   ensureStorage,
@@ -32,13 +33,28 @@ import type {
   RuntimeConfig
 } from "./types.js";
 
-const registry = loadProfiles();
+let registry: ProfileRegistry;
+try {
+  registry = loadProfiles();
+} catch (error) {
+  // Thrown during module evaluation, where main()'s catch cannot reach it. A
+  // raw stack trace here reaches the user as "server failed to start", hiding
+  // the specific misconfiguration the message names.
+  console.error(
+    `Facebook Marketplace MCP could not start: ${error instanceof Error ? error.message : String(error)}`
+  );
+  process.exit(1);
+}
 
 /** Drafts and photos are shared, so draft I/O always goes through one config. */
 const sharedConfig = resolveProfileConfig(registry);
 
+// Lock keys live in one keyspace, so they are namespaced: an account literally
+// named "publish" must not collide with the publish gate and deadlock.
+const profileLockKey = (profileId: string): string => `profile:${profileId}`;
+
 /** Serializes the Publish click across every account in a broadcast. */
-const PUBLISH_LOCK_KEY = "__marketplace_publish__";
+const PUBLISH_LOCK_KEY = "gate:publish";
 const PUBLISH_STAGGER_MIN_MS = 5000;
 const PUBLISH_STAGGER_MAX_MS = 15000;
 
@@ -408,7 +424,10 @@ server.registerTool(
       category: input.category,
       condition: input.condition,
       description: input.description,
-      location: input.location ?? sharedConfig.defaultLocation ?? "",
+      // Left empty unless the caller named one, so each account falls back to
+      // its own home_location at fill time instead of inheriting the default
+      // account's. fillListingForm resolves `draft.location || defaultLocation`.
+      location: input.location ?? "",
       photos,
       tags: input.tags ?? [],
       created_at: now,
@@ -629,7 +648,7 @@ async function withProfile<T>(
   fn: (config: RuntimeConfig) => Promise<T>
 ): Promise<T> {
   const config = resolveProfileConfig(registry, profileId);
-  return withLock(config.profileId, () => fn(config));
+  return withLock(profileLockKey(config.profileId), () => fn(config));
 }
 
 /**
@@ -666,6 +685,15 @@ async function broadcastListingDraft(input: {
     "broadcast_listing_draft"
   );
 
+  if (approvalToken && !input.profiles) {
+    // Publishing is irreversible, so it must never fan out to accounts the
+    // caller did not name. Defaulting to "all" is fine when every account only
+    // stops at its review screen.
+    throw new Error(
+      `broadcast_listing_draft requires an explicit profiles list when publishing. Name the accounts to publish to, or keep stop_before_publish=true. Configured profiles: ${[...registry.profiles.keys()].join(", ")}.`
+    );
+  }
+
   // Resolve every requested account before touching a browser so a typo fails
   // fast instead of half way through the fan-out.
   const targets = (input.profiles ?? [...registry.profiles.keys()]).map((profileId) =>
@@ -692,7 +720,7 @@ async function broadcastListingDraft(input: {
     input.fill_concurrency ?? Math.max(targets.length, 1),
     async (config): Promise<BroadcastProfileOutcome> => {
       try {
-        const result = await withLock(config.profileId, () =>
+        const result = await withLock(profileLockKey(config.profileId), () =>
           fillListingForm(config, structuredClone(draft), {
             // The draft file is shared, so per-account fill state must not be
             // written back into it.
@@ -726,23 +754,33 @@ async function broadcastListingDraft(input: {
   );
 
   const failed = results.filter((result) => result.status === "failed").length;
+  const unconfirmed = results.filter(
+    (result) => result.status === "publish_unconfirmed"
+  ).length;
   const notes: string[] = [];
+
   if (!approvalToken) {
     notes.push(
-      "Every account stopped at its review screen. Check each open browser window and click Publish yourself."
+      "Every account stopped at its review screen. Each one has its own browser window open; review and click Publish in each."
     );
   }
   if (failed > 0) {
     notes.push(
-      `${failed} of ${results.length} account(s) failed. An account that is not logged in parks on the Facebook login screen; log in there and retry just that profile.`
+      `${failed} of ${results.length} account(s) failed. Read each account's error below; a not-logged-in account fails while looking for form fields, which is the most common cause.`
+    );
+  }
+  if (unconfirmed > 0) {
+    notes.push(
+      `${unconfirmed} account(s) clicked Publish without a confirmed result. Check those accounts manually before retrying so the item is not posted twice.`
     );
   }
 
   return {
     draft_id: draft.draft_id,
     published: approvalToken !== undefined,
-    succeeded: results.length - failed,
+    succeeded: results.length - failed - unconfirmed,
     failed,
+    unconfirmed,
     results,
     started_at: startedAt,
     finished_at: new Date().toISOString(),

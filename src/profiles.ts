@@ -53,6 +53,15 @@ export interface ProfileRegistry {
 export function loadProfiles(base: BaseSettings = loadBaseSettings()): ProfileRegistry {
   const raw = readProfilesFile(base.profilesFile);
 
+  if (raw === undefined && base.profilesFileIsExplicit) {
+    // Falling back to single-account mode here would be silent and dangerous: a
+    // typo'd path makes broadcast_listing_draft report success on one account
+    // while the operator believes it posted to several.
+    throw new Error(
+      `FB_PROFILES_FILE points at ${base.profilesFile}, which does not exist. Create it, or unset FB_PROFILES_FILE to run as a single account.`
+    );
+  }
+
   if (raw === undefined) {
     const config = loadConfig(base);
     return {
@@ -180,10 +189,23 @@ function assertDistinctBrowserTargets(
   profiles: Map<string, RuntimeConfig>,
   profilesFile: string
 ): void {
+  const dataDirOwners = new Map<string, string>();
   const userDataDirOwners = new Map<string, string>();
   const cdpOwners = new Map<string, string>();
 
   for (const config of profiles.values()) {
+    // inventory.json, messages.db, screenshots and logs all hang off dataDir,
+    // so sharing one would silently merge two accounts' listings and buyer
+    // conversations into the same files.
+    const dataDirKey = normalizePathKey(config.dataDir);
+    const dataDirOwner = dataDirOwners.get(dataDirKey);
+    if (dataDirOwner) {
+      throw new Error(
+        `${profilesFile}: profiles "${dataDirOwner}" and "${config.profileId}" share the data directory ${config.dataDir}. Each account needs its own, or their listings and messages would be merged.`
+      );
+    }
+    dataDirOwners.set(dataDirKey, config.profileId);
+
     if (config.browserMode === "managed_profile") {
       const key = normalizePathKey(config.browserUserDataDir);
       const owner = userDataDirOwners.get(key);

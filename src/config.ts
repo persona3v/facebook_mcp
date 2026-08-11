@@ -58,6 +58,8 @@ function browserModeEnv(name: string, defaultValue: BrowserMode): BrowserMode {
 export interface BaseSettings {
   rootDataDir: string;
   profilesFile: string;
+  /** True when FB_PROFILES_FILE named the path, so a missing file is an error. */
+  profilesFileIsExplicit: boolean;
   browserMode: BrowserMode;
   browserCdpUrl: string;
   browserUserDataDirOverride?: string;
@@ -98,10 +100,12 @@ export function loadBaseSettings(): BaseSettings {
     optionalEnv("FB_MARKETPLACE_DATA_DIR") ??
     path.join(homedir(), ".hermes", "facebook-marketplace");
 
+  const profilesFileOverride = optionalEnv("FB_PROFILES_FILE");
+
   return {
     rootDataDir,
-    profilesFile:
-      optionalEnv("FB_PROFILES_FILE") ?? path.join(rootDataDir, "profiles.json"),
+    profilesFile: profilesFileOverride ?? path.join(rootDataDir, "profiles.json"),
+    profilesFileIsExplicit: profilesFileOverride !== undefined,
     browserMode: browserModeEnv("FB_BROWSER_MODE", "managed_profile"),
     browserCdpUrl: optionalEnv("FB_BROWSER_CDP_URL") ?? DEFAULT_CDP_URL,
     browserUserDataDirOverride:

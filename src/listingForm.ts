@@ -2,9 +2,11 @@ import type { Page } from "playwright";
 import type {
   FillListingOptions,
   FillListingResult,
+  FillListingStatus,
   ListingDraft,
   RuntimeConfig
 } from "./types.js";
+import { normalizeApprovalToken } from "./parse.js";
 import { updateDraft } from "./storage.js";
 import { getOrLaunchContext, getWorkingPage } from "./browser.js";
 import {
@@ -29,8 +31,18 @@ import {
 } from "./selectors.js";
 
 const PUBLISH_CONFIRM_TIMEOUT_MS = 30000;
-const CREATE_URL_PATTERN = /\/marketplace\/create\//i;
 const ITEM_URL_PATTERN = /\/marketplace\/item\/\d+/i;
+const SELLING_URL_PATTERN = /\/marketplace\/you\/selling/i;
+// Posting the same item across accounts is what trips Facebook's risk review,
+// so a checkpoint or a bounce back to login is a likely destination after the
+// click and must never be mistaken for a successful publish.
+const BLOCKED_URL_PATTERN = /\/(checkpoint|login|recover|confirmemail|disabled)/i;
+
+interface PublishConfirmation {
+  outcome: "published" | "blocked" | "unconfirmed";
+  url: string;
+  listingUrl: string | null;
+}
 
 export async function fillListingForm(
   config: RuntimeConfig,
@@ -57,34 +69,46 @@ export async function fillListingForm(
     await fillDescription(page, draft.description, notes);
     await fillLocation(page, draft.location || config.defaultLocation, notes);
 
+    let status: FillListingStatus = "ready_for_manual_publish";
     let listingUrl: string | null = null;
+
     if (options?.publish) {
+      // Re-validate here rather than trusting the caller's gate, so no future
+      // path can reach a Publish click without a real approval token.
+      normalizeApprovalToken(options.publish.approvalToken, "publishing a listing");
       const runExclusive = options.publish.runExclusive ?? ((fn) => fn());
-      listingUrl = await runExclusive(() => publishListing(page, notes));
+      const confirmation = await runExclusive(() => publishListing(page, notes));
+      listingUrl = confirmation.listingUrl;
+      status = confirmation.outcome === "published" ? "published" : "publish_unconfirmed";
       notes.push(
-        "Published automatically because an explicit human approval token was supplied."
+        status === "published"
+          ? "Published automatically because an explicit human approval token was supplied."
+          : "Clicked Publish with an explicit human approval token, but could not confirm the result. Check this account manually before retrying so the item is not posted twice."
       );
     }
 
-    const published = options?.publish !== undefined;
+    const attemptedPublish = options?.publish !== undefined;
     const screenshotPath = await captureScreenshot(
       config,
       page,
-      published ? `${draft.draft_id}_published` : draft.draft_id
+      attemptedPublish ? `${draft.draft_id}_${status}` : draft.draft_id
     );
 
     if (options?.persistStatus !== false) {
-      draft.status = published ? "published" : "form_filled";
+      draft.status = status === "published" ? "published" : "form_filled";
       draft.updated_at = new Date().toISOString();
       await updateDraft(config, draft);
     }
 
     return {
-      status: published ? "published" : "ready_for_manual_publish",
+      status,
       draft_id: draft.draft_id,
       profile: config.profileId,
       screenshot_path: screenshotPath,
-      browser_state: published ? "published_screen" : "waiting_on_publish_screen",
+      browser_state:
+        status === "ready_for_manual_publish"
+          ? "waiting_on_publish_screen"
+          : "published_screen",
       listing_url: listingUrl,
       notes
     };
@@ -109,7 +133,10 @@ export async function fillListingForm(
  * human approval token; the default path still stops at the review screen.
  * Returns the listing URL when Facebook lands on the item page, otherwise null.
  */
-async function publishListing(page: Page, notes: string[]): Promise<string | null> {
+async function publishListing(
+  page: Page,
+  notes: string[]
+): Promise<PublishConfirmation> {
   let publishButton = await firstUsableLocator(
     page,
     PUBLISH_BUTTON_SELECTORS,
@@ -140,30 +167,53 @@ async function publishListing(page: Page, notes: string[]): Promise<string | nul
     .catch(() => undefined);
   await publishButton.click({ timeout: FIELD_TIMEOUT_MS });
 
-  const finalUrl = await waitForPublishConfirmed(page);
-  if (!finalUrl) {
+  const confirmation = await waitForPublishConfirmed(page);
+
+  if (confirmation.outcome === "blocked") {
     throw new Error(
-      "Clicked Publish but could not confirm that Facebook accepted the listing. Review the open browser before retrying so the item is not posted twice."
+      `Clicked Publish but Facebook redirected to ${confirmation.url}. The listing was not published; this account needs manual attention (login, 2FA, or a security checkpoint) before retrying.`
     );
   }
 
-  const itemMatch = finalUrl.match(ITEM_URL_PATTERN);
-  return itemMatch ? `https://www.facebook.com${itemMatch[0]}` : null;
+  if (confirmation.outcome === "unconfirmed") {
+    notes.push(
+      `Could not confirm the publish. The browser ended on ${confirmation.url}, which is neither a listing page nor the seller listings page.`
+    );
+  }
+
+  return confirmation;
 }
 
 /**
- * Facebook navigates away from the create flow once a listing is accepted, so
- * leaving that URL is the confirmation signal.
+ * Requires a positive destination. Merely leaving the create flow is not proof
+ * of success: a rejected or risk-checked publish also navigates away, and
+ * reporting that as published would tell the operator an item is live when it
+ * is not.
  */
-async function waitForPublishConfirmed(page: Page): Promise<string | undefined> {
+async function waitForPublishConfirmed(page: Page): Promise<PublishConfirmation> {
   const deadline = Date.now() + PUBLISH_CONFIRM_TIMEOUT_MS;
   for (;;) {
     const url = page.url();
-    if (!CREATE_URL_PATTERN.test(url)) {
-      return url;
+
+    if (BLOCKED_URL_PATTERN.test(url)) {
+      return { outcome: "blocked", url, listingUrl: null };
     }
+
+    const item = url.match(ITEM_URL_PATTERN);
+    if (item) {
+      return {
+        outcome: "published",
+        url,
+        listingUrl: `https://www.facebook.com${item[0]}`
+      };
+    }
+
+    if (SELLING_URL_PATTERN.test(url)) {
+      return { outcome: "published", url, listingUrl: null };
+    }
+
     if (Date.now() >= deadline) {
-      return undefined;
+      return { outcome: "unconfirmed", url, listingUrl: null };
     }
     await page.waitForTimeout(500);
   }

@@ -15,7 +15,11 @@ export interface ListingDraft {
   status: ListingDraftStatus;
 }
 
-export type FillListingStatus = "ready_for_manual_publish" | "published";
+export type FillListingStatus =
+  | "ready_for_manual_publish"
+  | "published"
+  /** Publish was clicked but Facebook never landed on a page proving success. */
+  | "publish_unconfirmed";
 
 export interface FillListingResult {
   status: FillListingStatus;
@@ -215,6 +219,8 @@ export interface BroadcastListingResult {
   published: boolean;
   succeeded: number;
   failed: number;
+  /** Publish was clicked but not confirmed; these need a manual check. */
+  unconfirmed: number;
   results: BroadcastProfileOutcome[];
   started_at: string;
   finished_at: string;
