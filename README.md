@@ -309,7 +309,7 @@ A missing or placeholder token is refused. The token is only compared, never wri
 
 Posting the same item to several accounts in quick succession is exactly the pattern Facebook's spam checks look for. `broadcast_listing_draft` therefore fills every account's form in parallel — that part is ordinary browsing — but serializes the `Publish` clicks with a randomized 5-15 second gap. Set `publish_stagger_ms` for a fixed gap, or `fill_concurrency` to fill fewer accounts at a time.
 
-### Directly attach to an already logged-in Chrome
+## Directly attach to an already logged-in Chrome
 
 To let the MCP server use a Chrome window you already logged into, start Chrome with a remote debugging port before opening Facebook:
 
@@ -336,6 +336,8 @@ or pass these optional fields to any browser-using tool:
 ```
 
 Ordinary Chrome windows cannot be attached after the fact; Chrome must be launched with `--remote-debugging-port` first. If CDP connection fails, the tool reports a setup error and does not silently fall back to a separate browser profile.
+
+To attach more than one account this way, start a separate Chrome per account on its own port and its own user data directory, then give each profile its own `browser_cdp_url`. The server refuses to start if two profiles point at the same endpoint, because both would end up driving the same browser.
 
 ## Browser Fingerprint Stealth
 

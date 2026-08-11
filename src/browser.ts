@@ -199,9 +199,10 @@ async function disposeSession(pending: Promise<BrowserSession>): Promise<void> {
   session.detach();
 
   if (session.mode === "existing_cdp") {
-    // The Chrome behind a CDP endpoint belongs to the user, not to this server.
-    // Drop the reference instead of closing so their logged-in window survives;
-    // the socket goes away with the process.
+    // Detach rather than close: the Chrome behind a CDP endpoint was started by
+    // the user. Closing appears to only disconnect, but the downside if that is
+    // ever wrong is destroying a logged-in session, while the downside of
+    // detaching is a socket that lives until this process exits.
     return;
   }
 
