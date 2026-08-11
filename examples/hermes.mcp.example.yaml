@@ -8,5 +8,8 @@ mcp_servers:
       FB_MARKETPLACE_HOME_LOCATION: "Minneapolis, MN"
       FB_MARKETPLACE_MESSAGES_URL: "https://www.facebook.com/marketplace/inbox"
       FB_HEADLESS: "false"
+      # Optional: drive several Facebook accounts. See examples/profiles.example.json.
+      # Leave unset for single-account mode.
+      # FB_PROFILES_FILE: "/Users/saber/.hermes/facebook-marketplace/profiles.json"
     timeout: 180
     connect_timeout: 60

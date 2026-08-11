@@ -2,10 +2,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { loadConfig } from "./config.js";
 import {
   checkMarketplaceMessages,
-  closeBrowserContext,
+  closeAllBrowserContexts,
   draftReplyForThread,
   fillListingForm,
   getMessageThread,
@@ -14,6 +13,9 @@ import {
   sendReply
 } from "./facebook.js";
 import { ensureMessageStore } from "./messageStore.js";
+import { withLock } from "./mutex.js";
+import { normalizeApprovalToken } from "./parse.js";
+import { loadProfiles, resolveProfileConfig, summarizeProfiles } from "./profiles.js";
 import {
   assertReadableFiles,
   ensureStorage,
@@ -21,9 +23,24 @@ import {
   makeDraftId,
   saveDraft
 } from "./storage.js";
-import type { BrowserConnectionOptions, BrowserMode, ListingDraft } from "./types.js";
+import type {
+  BroadcastListingResult,
+  BroadcastProfileOutcome,
+  BrowserConnectionOptions,
+  BrowserMode,
+  ListingDraft,
+  RuntimeConfig
+} from "./types.js";
 
-const config = loadConfig();
+const registry = loadProfiles();
+
+/** Drafts and photos are shared, so draft I/O always goes through one config. */
+const sharedConfig = resolveProfileConfig(registry);
+
+/** Serializes the Publish click across every account in a broadcast. */
+const PUBLISH_LOCK_KEY = "__marketplace_publish__";
+const PUBLISH_STAGGER_MIN_MS = 5000;
+const PUBLISH_STAGGER_MAX_MS = 15000;
 
 const createListingDraftSchema = {
   title: z.string().min(1).max(100),
@@ -34,6 +51,17 @@ const createListingDraftSchema = {
   location: z.string().min(1).max(160).optional(),
   photos: z.array(z.string().min(1)).default([]),
   tags: z.array(z.string().min(1).max(80)).default([])
+};
+
+const profileSchema = {
+  profile: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "Configured Facebook account to act as. Call list_profiles to see the options. Defaults to the default profile."
+    )
 };
 
 const browserConnectionSchema = {
@@ -49,19 +77,63 @@ const browserConnectionSchema = {
     .describe("CDP endpoint for browser_mode=existing_cdp, for example http://127.0.0.1:9222.")
 };
 
+const publishAuthorizationSchema = {
+  stop_before_publish: z
+    .boolean()
+    .default(true)
+    .describe("Keep true to fill the form and stop at the review screen."),
+  approval_token: z
+    .string()
+    .trim()
+    .min(8)
+    .optional()
+    .describe(
+      "Required only with stop_before_publish=false. Publishing without an explicit human approval token is refused."
+    )
+};
+
 const fillListingFormSchema = {
   draft_id: z.string().min(1),
-  stop_before_publish: z.boolean().default(true),
+  ...publishAuthorizationSchema,
+  ...profileSchema,
   ...browserConnectionSchema
+};
+
+const broadcastListingDraftSchema = {
+  draft_id: z.string().min(1),
+  profiles: z
+    .array(z.string().trim().min(1))
+    .min(1)
+    .optional()
+    .describe("Accounts to list on. Defaults to every configured profile."),
+  ...publishAuthorizationSchema,
+  fill_concurrency: z
+    .number()
+    .int()
+    .min(1)
+    .max(16)
+    .optional()
+    .describe("How many accounts fill their form at once. Defaults to all of them."),
+  publish_stagger_ms: z
+    .number()
+    .int()
+    .min(0)
+    .max(300000)
+    .optional()
+    .describe(
+      "Fixed gap between publishes instead of the default randomized 5-15s spacing."
+    )
 };
 
 const listMyListingsSchema = {
   max_scrolls: z.number().int().min(0).max(10).default(3),
+  ...profileSchema,
   ...browserConnectionSchema
 };
 
 const getListingDetailSchema = {
   listing_id: z.string().min(1),
+  ...profileSchema,
   ...browserConnectionSchema
 };
 
@@ -70,24 +142,28 @@ const checkMarketplaceMessagesSchema = {
   include_read: z.boolean().default(false),
   max_threads: z.number().int().min(1).max(100).default(20),
   max_scrolls: z.number().int().min(0).max(10).default(3),
+  ...profileSchema,
   ...browserConnectionSchema
 };
 
 const getMessageThreadSchema = {
   thread_id: z.string().min(1),
+  ...profileSchema,
   ...browserConnectionSchema
 };
 
 const draftReplySchema = {
   thread_id: z.string().min(1),
   intent: z.string().min(1).default("availability"),
-  constraints: z.record(z.unknown()).default({})
+  constraints: z.record(z.unknown()).default({}),
+  ...profileSchema
 };
 
 const sendReplySchema = {
   thread_id: z.string().min(1),
   message: z.string().trim().min(1).max(2000),
   approval_token: z.string().trim().min(8),
+  ...profileSchema,
   ...browserConnectionSchema
 };
 
@@ -129,7 +205,8 @@ server.registerPrompt(
       [
         "You are preparing a Facebook Marketplace listing through the local MCP server.",
         "Use the user's notes to produce concise Marketplace-ready fields, then call create_listing_draft if enough information is present.",
-        "Do not publish. Do not click Publish. If the user later asks to fill the form, call fill_listing_form with stop_before_publish=true.",
+        "Do not publish. If the user later asks to fill the form, call fill_listing_form with stop_before_publish=true.",
+        "To list on several accounts at once, call broadcast_listing_draft. Keep stop_before_publish=true unless the user explicitly authorizes publishing and supplies an approval token.",
         "Ask a short follow-up if required fields are missing: title, price, category, condition, description, or usable photo paths.",
         "Keep pickup location general and avoid exact addresses, payment instructions, or anything that could increase account risk.",
         "",
@@ -168,7 +245,7 @@ server.registerPrompt(
       [
         "Review the draft for Marketplace clarity, pricing consistency, safety, and missing information.",
         "If the form needs to be opened or refreshed, call resume_listing_draft or fill_listing_form and keep stop_before_publish=true.",
-        "Never publish automatically. Tell the user they must manually review Facebook's final screen and click Publish themselves.",
+        "Do not publish on your own initiative. Publishing requires the user to explicitly ask for it and to supply an approval token; otherwise tell them to review Facebook's final screen and click Publish themselves.",
         "Flag risky content: exact address, payment app instructions, pressure tactics, policy-sensitive wording, or private buyer data.",
         "Return a compact review with: ready/not ready, issues, suggested edits, and next safe action.",
         "",
@@ -319,7 +396,7 @@ server.registerTool(
     inputSchema: createListingDraftSchema
   },
   async (input) => {
-    await ensureStorage(config);
+    await ensureStorage(sharedConfig);
     const photos = input.photos ?? [];
     await assertReadableFiles(photos);
 
@@ -331,7 +408,7 @@ server.registerTool(
       category: input.category,
       condition: input.condition,
       description: input.description,
-      location: input.location ?? config.defaultLocation ?? "",
+      location: input.location ?? sharedConfig.defaultLocation ?? "",
       photos,
       tags: input.tags ?? [],
       created_at: now,
@@ -339,7 +416,7 @@ server.registerTool(
       status: "local_draft"
     };
 
-    const draftPath = await saveDraft(config, draft);
+    const draftPath = await saveDraft(sharedConfig, draft);
     return jsonResult({
       draft_id: draft.draft_id,
       status: "saved",
@@ -349,19 +426,47 @@ server.registerTool(
 );
 
 server.registerTool(
+  "list_profiles",
+  {
+    title: "List configured Facebook accounts",
+    description:
+      "Return every configured Facebook profile this server can act as, including which one is the default.",
+    inputSchema: {}
+  },
+  async () =>
+    jsonResult({
+      default_profile: registry.defaultProfileId,
+      source: registry.source,
+      profiles_file: registry.profilesFile,
+      profiles: summarizeProfiles(registry)
+    })
+);
+
+server.registerTool(
   "fill_listing_form",
   {
     title: "Fill Facebook Marketplace listing form",
     description:
-      "Open Facebook Marketplace, fill a saved listing draft, save a screenshot, and stop before Publish.",
+      "Open Facebook Marketplace, fill a saved listing draft, save a screenshot, and stop before Publish unless a human approval token authorizes publishing.",
     inputSchema: fillListingFormSchema
   },
   async (input) => {
-    assertStopBeforePublish(input.stop_before_publish);
-    const draft = await loadDraft(config, input.draft_id);
+    const approvalToken = assertPublishAuthorized(
+      input.stop_before_publish,
+      input.approval_token,
+      "fill_listing_form"
+    );
+    const draft = await loadDraft(sharedConfig, input.draft_id);
     await assertReadableFiles(draft.photos);
-    const result = await fillListingForm(config, draft, browserOptionsFromInput(input));
-    return jsonResult(result);
+
+    return jsonResult(
+      await withProfile(input.profile, (config) =>
+        fillListingForm(config, draft, {
+          ...browserOptionsFromInput(input),
+          publish: approvalToken ? { approvalToken } : undefined
+        })
+      )
+    );
   }
 );
 
@@ -373,15 +478,31 @@ server.registerTool(
       "Reload a saved draft and fill the Facebook Marketplace form again, stopping before Publish.",
     inputSchema: {
       draft_id: z.string().min(1),
+      ...profileSchema,
       ...browserConnectionSchema
     }
   },
   async (input) => {
-    const draft = await loadDraft(config, input.draft_id);
+    const draft = await loadDraft(sharedConfig, input.draft_id);
     await assertReadableFiles(draft.photos);
-    const result = await fillListingForm(config, draft, browserOptionsFromInput(input));
-    return jsonResult(result);
+
+    return jsonResult(
+      await withProfile(input.profile, (config) =>
+        fillListingForm(config, draft, browserOptionsFromInput(input))
+      )
+    );
   }
+);
+
+server.registerTool(
+  "broadcast_listing_draft",
+  {
+    title: "Broadcast a listing draft to every Facebook account",
+    description:
+      "Fill one saved draft into the Marketplace form of several configured accounts at once. Every account fills in parallel; publishing, when authorized, is serialized and staggered so the same item is never pushed to all accounts in the same instant.",
+    inputSchema: broadcastListingDraftSchema
+  },
+  async (input) => jsonResult(await broadcastListingDraft(input))
 );
 
 server.registerTool(
@@ -392,13 +513,15 @@ server.registerTool(
       "Open the Facebook Marketplace seller listings page, scrape visible listings, and sync local inventory.",
     inputSchema: listMyListingsSchema
   },
-  async (input) => {
-    const result = await listMyListings(config, {
-      maxScrolls: input.max_scrolls,
-      ...browserOptionsFromInput(input)
-    });
-    return jsonResult(result);
-  }
+  async (input) =>
+    jsonResult(
+      await withProfile(input.profile, (config) =>
+        listMyListings(config, {
+          maxScrolls: input.max_scrolls,
+          ...browserOptionsFromInput(input)
+        })
+      )
+    )
 );
 
 server.registerTool(
@@ -409,14 +532,12 @@ server.registerTool(
       "Open a Marketplace listing detail page, scrape visible metadata, and update local inventory.",
     inputSchema: getListingDetailSchema
   },
-  async (input) => {
-    const result = await getListingDetail(
-      config,
-      input.listing_id,
-      browserOptionsFromInput(input)
-    );
-    return jsonResult(result);
-  }
+  async (input) =>
+    jsonResult(
+      await withProfile(input.profile, (config) =>
+        getListingDetail(config, input.listing_id, browserOptionsFromInput(input))
+      )
+    )
 );
 
 server.registerTool(
@@ -427,16 +548,18 @@ server.registerTool(
       "Open the Marketplace/Messenger inbox, scrape visible threads, store them locally, and return newly seen buyer messages.",
     inputSchema: checkMarketplaceMessagesSchema
   },
-  async (input) => {
-    const result = await checkMarketplaceMessages(config, {
-      since: input.since,
-      includeRead: input.include_read,
-      maxThreads: input.max_threads,
-      maxScrolls: input.max_scrolls,
-      ...browserOptionsFromInput(input)
-    });
-    return jsonResult(result);
-  }
+  async (input) =>
+    jsonResult(
+      await withProfile(input.profile, (config) =>
+        checkMarketplaceMessages(config, {
+          since: input.since,
+          includeRead: input.include_read,
+          maxThreads: input.max_threads,
+          maxScrolls: input.max_scrolls,
+          ...browserOptionsFromInput(input)
+        })
+      )
+    )
 );
 
 server.registerTool(
@@ -447,10 +570,12 @@ server.registerTool(
       "Open a saved Marketplace/Messenger thread, scrape visible messages, and update local message memory.",
     inputSchema: getMessageThreadSchema
   },
-  async (input) => {
-    const result = await getMessageThread(config, input.thread_id, browserOptionsFromInput(input));
-    return jsonResult(result);
-  }
+  async (input) =>
+    jsonResult(
+      await withProfile(input.profile, (config) =>
+        getMessageThread(config, input.thread_id, browserOptionsFromInput(input))
+      )
+    )
 );
 
 server.registerTool(
@@ -461,14 +586,16 @@ server.registerTool(
       "Generate a local reply draft from a saved Marketplace/Messenger thread and classify reply risk. This never sends a message.",
     inputSchema: draftReplySchema
   },
-  async (input) => {
-    const result = await draftReplyForThread(config, {
-      threadId: input.thread_id,
-      intent: input.intent,
-      constraints: input.constraints
-    });
-    return jsonResult(result);
-  }
+  async (input) =>
+    // Reads that account's local message store only, so it skips the browser
+    // lock and never queues behind a running scrape.
+    jsonResult(
+      await draftReplyForThread(resolveProfileConfig(registry, input.profile), {
+        threadId: input.thread_id,
+        intent: input.intent,
+        constraints: input.constraints
+      })
+    )
 );
 
 server.registerTool(
@@ -479,23 +606,195 @@ server.registerTool(
       "Open a saved Marketplace/Messenger thread, send a reply only when an approval token is supplied, and log the sent message locally.",
     inputSchema: sendReplySchema
   },
-  async (input) => {
-    const result = await sendReply(config, {
-      threadId: input.thread_id,
-      message: input.message,
-      approvalToken: input.approval_token,
-      ...browserOptionsFromInput(input)
-    });
-    return jsonResult(result);
-  }
+  async (input) =>
+    jsonResult(
+      await withProfile(input.profile, (config) =>
+        sendReply(config, {
+          threadId: input.thread_id,
+          message: input.message,
+          approvalToken: input.approval_token,
+          ...browserOptionsFromInput(input)
+        })
+      )
+    )
 );
 
-function assertStopBeforePublish(stopBeforePublish: boolean): void {
-  if (!stopBeforePublish) {
+/**
+ * Runs browser work as one account. The per-profile lock keeps two calls from
+ * driving the same Chrome window (or launching it twice against a locked user
+ * data directory) while leaving separate accounts free to run in parallel.
+ */
+async function withProfile<T>(
+  profileId: string | undefined,
+  fn: (config: RuntimeConfig) => Promise<T>
+): Promise<T> {
+  const config = resolveProfileConfig(registry, profileId);
+  return withLock(config.profileId, () => fn(config));
+}
+
+/**
+ * Publishing stays refused by default. It is allowed only when the caller both
+ * turns off stop_before_publish and supplies a real human approval token.
+ */
+function assertPublishAuthorized(
+  stopBeforePublish: boolean,
+  approvalToken: string | undefined,
+  requester: string
+): string | undefined {
+  if (stopBeforePublish) {
+    return undefined;
+  }
+  if (!approvalToken) {
     throw new Error(
-      "Phase 1 refuses automatic publishing. Call fill_listing_form with stop_before_publish=true."
+      `${requester} refuses to publish without a human approval token. Pass approval_token together with stop_before_publish=false, or keep stop_before_publish=true to stop at the review screen.`
     );
   }
+  return normalizeApprovalToken(approvalToken, requester);
+}
+
+async function broadcastListingDraft(input: {
+  draft_id: string;
+  profiles?: string[];
+  stop_before_publish: boolean;
+  approval_token?: string;
+  fill_concurrency?: number;
+  publish_stagger_ms?: number;
+}): Promise<BroadcastListingResult> {
+  const approvalToken = assertPublishAuthorized(
+    input.stop_before_publish,
+    input.approval_token,
+    "broadcast_listing_draft"
+  );
+
+  // Resolve every requested account before touching a browser so a typo fails
+  // fast instead of half way through the fan-out.
+  const targets = (input.profiles ?? [...registry.profiles.keys()]).map((profileId) =>
+    resolveProfileConfig(registry, profileId)
+  );
+  assertDistinctTargets(targets);
+
+  const draft = await loadDraft(sharedConfig, input.draft_id);
+  await assertReadableFiles(draft.photos);
+
+  const startedAt = new Date().toISOString();
+  let publishCount = 0;
+  const runPublishExclusive = <T,>(fn: () => Promise<T>): Promise<T> =>
+    withLock(PUBLISH_LOCK_KEY, async () => {
+      if (publishCount > 0) {
+        await delay(input.publish_stagger_ms ?? randomStaggerMs());
+      }
+      publishCount += 1;
+      return fn();
+    });
+
+  const results = await mapWithConcurrency(
+    targets,
+    input.fill_concurrency ?? Math.max(targets.length, 1),
+    async (config): Promise<BroadcastProfileOutcome> => {
+      try {
+        const result = await withLock(config.profileId, () =>
+          fillListingForm(config, structuredClone(draft), {
+            // The draft file is shared, so per-account fill state must not be
+            // written back into it.
+            persistStatus: false,
+            publish: approvalToken
+              ? { approvalToken, runExclusive: runPublishExclusive }
+              : undefined
+          })
+        );
+        return {
+          profile: config.profileId,
+          label: config.label ?? null,
+          status: result.status,
+          screenshot_path: result.screenshot_path,
+          listing_url: result.listing_url,
+          error: null,
+          notes: result.notes
+        };
+      } catch (error) {
+        return {
+          profile: config.profileId,
+          label: config.label ?? null,
+          status: "failed",
+          screenshot_path: null,
+          listing_url: null,
+          error: error instanceof Error ? error.message : String(error),
+          notes: []
+        };
+      }
+    }
+  );
+
+  const failed = results.filter((result) => result.status === "failed").length;
+  const notes: string[] = [];
+  if (!approvalToken) {
+    notes.push(
+      "Every account stopped at its review screen. Check each open browser window and click Publish yourself."
+    );
+  }
+  if (failed > 0) {
+    notes.push(
+      `${failed} of ${results.length} account(s) failed. An account that is not logged in parks on the Facebook login screen; log in there and retry just that profile.`
+    );
+  }
+
+  return {
+    draft_id: draft.draft_id,
+    published: approvalToken !== undefined,
+    succeeded: results.length - failed,
+    failed,
+    results,
+    started_at: startedAt,
+    finished_at: new Date().toISOString(),
+    notes
+  };
+}
+
+function assertDistinctTargets(targets: RuntimeConfig[]): void {
+  const seen = new Set<string>();
+  for (const target of targets) {
+    if (seen.has(target.profileId)) {
+      throw new Error(
+        `Profile "${target.profileId}" was requested more than once. List each account at most once.`
+      );
+    }
+    seen.add(target.profileId);
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await fn(items[index]);
+    }
+  };
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
+function randomStaggerMs(): number {
+  const span = PUBLISH_STAGGER_MAX_MS - PUBLISH_STAGGER_MIN_MS;
+  return PUBLISH_STAGGER_MIN_MS + Math.floor(Math.random() * (span + 1));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function browserOptionsFromInput(input: {
@@ -545,8 +844,12 @@ function optionalPromptLine(
 }
 
 async function main(): Promise<void> {
-  await ensureStorage(config);
-  await ensureMessageStore(config);
+  // Sequential: several profiles share the drafts and photos directories, so
+  // creating them one at a time avoids concurrent mkdir on the same paths.
+  for (const profileConfig of registry.profiles.values()) {
+    await ensureStorage(profileConfig);
+    await ensureMessageStore(profileConfig);
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -559,7 +862,7 @@ async function shutdown(exitCode: number): Promise<void> {
   }
 
   shuttingDown = true;
-  await closeBrowserContext();
+  await closeAllBrowserContexts();
   process.exit(exitCode);
 }
 

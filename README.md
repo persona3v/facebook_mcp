@@ -5,11 +5,11 @@ Local Phase 1, Phase 2, Phase 3, and Phase 4 MCP server for creating Facebook Ma
 This implementation follows these safety boundaries:
 
 - It never stores a Facebook password.
-- It uses a local persistent browser profile.
+- It uses a local persistent browser profile, one per configured account.
 - It does not bypass login, 2FA, CAPTCHA, or Facebook risk checks.
-- It refuses to publish automatically.
+- It refuses to publish unless the caller both sets `stop_before_publish=false` and supplies a human approval token. By default it stops with the browser open so the user reviews and clicks `Publish` themselves.
 - It refuses to send buyer replies without a human approval token.
-- It stops with the browser open so the user can review and manually click `Publish`.
+- When broadcasting to several accounts it fills the forms in parallel but staggers the `Publish` clicks.
 
 ## Tools
 
@@ -32,6 +32,10 @@ Input:
 }
 ```
 
+### `list_profiles`
+
+Returns every configured Facebook account, which one is the default, and where each account's data lives. Takes no input.
+
 ### `fill_listing_form`
 
 Loads a saved draft, opens `https://www.facebook.com/marketplace/create/item`, fills the form, saves a screenshot, and stops before publish.
@@ -41,9 +45,28 @@ Input:
 ```json
 {
   "draft_id": "draft_20260510_193000_abcd",
+  "stop_before_publish": true,
+  "profile": "personal"
+}
+```
+
+Omit `profile` to use the default account. To publish instead of stopping, see [Publishing](#publishing).
+
+### `broadcast_listing_draft`
+
+Fills one saved draft into the Marketplace form of several accounts at once. Every account fills in parallel; when publishing is authorized the `Publish` clicks are serialized and staggered.
+
+Input:
+
+```json
+{
+  "draft_id": "draft_20260510_193000_abcd",
+  "profiles": ["personal", "business"],
   "stop_before_publish": true
 }
 ```
+
+Omit `profiles` to target every configured account. The result lists each account separately with its own status, screenshot path, and error, so one account failing (for example, one that is not logged in) does not stop the others.
 
 ### `resume_listing_draft`
 
@@ -204,6 +227,7 @@ Copy `.env.example` if your launcher supports env files, or set these variables 
 Important variables:
 
 - `FB_MARKETPLACE_DATA_DIR`: local state directory. Default: `~/.hermes/facebook-marketplace`.
+- `FB_PROFILES_FILE`: JSON file describing multiple Facebook accounts. Default: `<data-dir>/profiles.json`. Absent means single-account mode. See [Multiple Facebook Accounts](#multiple-facebook-accounts).
 - `FB_MARKETPLACE_HOME_LOCATION`: fallback listing location.
 - `FB_MARKETPLACE_SELLING_URL`: seller listings URL. Default: `https://www.facebook.com/marketplace/you/selling`.
 - `FB_MARKETPLACE_MESSAGES_URL`: Marketplace/Messenger inbox URL. Default: `https://www.facebook.com/marketplace/inbox`.
@@ -224,6 +248,66 @@ Recommended first run:
 3. Log in manually in the opened browser if Facebook asks.
 4. Complete any 2FA or CAPTCHA manually.
 5. Re-run `fill_listing_form` after login if the form was not visible.
+
+## Multiple Facebook Accounts
+
+The server can drive several accounts at once. Create a `profiles.json` (default location `~/.hermes/facebook-marketplace/profiles.json`, override with `FB_PROFILES_FILE`) modeled on `examples/profiles.example.json`:
+
+```json
+{
+  "version": 1,
+  "default_profile": "personal",
+  "profiles": [
+    { "id": "personal", "label": "Personal account", "home_location": "Minneapolis, MN" },
+    { "id": "business", "label": "Business account" }
+  ]
+}
+```
+
+Every field except `id` is optional and falls back to the environment variables above. Per-account overrides: `label`, `data_dir`, `browser_user_data_dir`, `browser_mode`, `browser_cdp_url`, `browser_channel`, `chrome_profile_name`, `home_location`, `headless`.
+
+**If this file does not exist, nothing changes** — the server runs as a single account named `default` using exactly the paths it always used.
+
+What is shared and what is separate:
+
+| Data | Scope | Why |
+| --- | --- | --- |
+| `drafts/`, `photos/` | shared | You author a listing once and send it to several accounts. |
+| `inventory.json`, `messages.db` | per account | Listings and buyer conversations belong to one account. |
+| `screenshots/`, `logs/` | per account | Makes it obvious which account a failure came from. |
+| `browser-profile/` | per account | Required — Chrome locks a user data directory to one instance. |
+
+Each account needs its own manual Facebook login once. Run `list_profiles`, then call any browser tool with that `profile` to open its window and log in.
+
+The server refuses to start if two accounts would collide: sharing a `browser_user_data_dir` (Chrome cannot open it twice) or, in `existing_cdp` mode, sharing a CDP endpoint (both accounts would silently drive the same browser).
+
+`FB_STEALTH` is global rather than per-account, because the stealth patches are registered once on the shared browser launcher.
+
+### Migrating an existing single-account install
+
+Adding a `profiles.json` does **not** move your existing data. The old `browser-profile/`, `inventory.json`, and `messages.db` sit at the data directory root, while named accounts get `<data-dir>/profiles/<id>/`, so you would be asked to log in again everywhere. To keep the account you already use, point one profile at the old location:
+
+```json
+{ "id": "personal", "data_dir": "~/.hermes/facebook-marketplace" }
+```
+
+## Publishing
+
+By default nothing is ever published: the form is filled and the browser is left open on the review screen for you.
+
+To let the server click `Publish`, both of these are required on the same call:
+
+```json
+{
+  "draft_id": "draft_20260510_193000_abcd",
+  "stop_before_publish": false,
+  "approval_token": "human-approved-2026-08-11"
+}
+```
+
+A missing or placeholder token is refused. The token is only compared, never written to disk or included in results.
+
+Posting the same item to several accounts in quick succession is exactly the pattern Facebook's spam checks look for. `broadcast_listing_draft` therefore fills every account's form in parallel — that part is ordinary browsing — but serializes the `Publish` clicks with a randomized 5-15 second gap. Set `publish_stagger_ms` for a fixed gap, or `fill_concurrency` to fill fewer accounts at a time.
 
 ### Directly attach to an already logged-in Chrome
 
@@ -271,7 +355,7 @@ See `examples/hermes.mcp.example.yaml`.
 
 ## Local Data
 
-Default local state:
+Default local state for a single account (no `profiles.json`):
 
 ```text
 ~/.hermes/facebook-marketplace/
@@ -282,6 +366,24 @@ Default local state:
   browser-profile/
   inventory.json
   messages.db
+```
+
+With `profiles.json`, drafts and photos stay shared at the root and each account gets its own subtree:
+
+```text
+~/.hermes/facebook-marketplace/
+  profiles.json
+  drafts/                      # shared
+  photos/                      # shared
+  profiles/
+    personal/
+      screenshots/
+      logs/
+      browser-profile/
+      inventory.json
+      messages.db
+    business/
+      ...
 ```
 
 The server creates these directories with restricted permissions when possible.

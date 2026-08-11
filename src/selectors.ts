@@ -59,6 +59,21 @@ export const COMPOSER_SELECTORS = [
   '[contenteditable="true"][aria-label*="Reply" i]'
 ];
 
+// :text-is matches an element's own exact text, so these do not climb to a
+// wrapper div that merely contains the word somewhere inside it.
+export const PUBLISH_BUTTON_SELECTORS = [
+  '[role="button"][aria-label="Publish"]',
+  '[role="button"]:text-is("Publish")',
+  'button:text-is("Publish")'
+];
+
+// The create form is a two-step flow on some accounts: fill, Next, then Publish.
+export const LISTING_NEXT_BUTTON_SELECTORS = [
+  '[role="button"][aria-label="Next"]',
+  '[role="button"]:text-is("Next")',
+  'button:text-is("Next")'
+];
+
 export const CREATE_FORM_ANCHORS = [
   ...TITLE_FIELD_SELECTORS,
   PHOTO_INPUT_SELECTOR,
