@@ -478,13 +478,16 @@ export function normalizeReplyMessage(message: string): string {
   return trimmed;
 }
 
-export function normalizeApprovalToken(approvalToken: string): string {
+export function normalizeApprovalToken(
+  approvalToken: string,
+  requester = "send_reply"
+): string {
   const trimmed = approvalToken.trim();
   if (
     trimmed.length < 8 ||
     /^(none|null|false|auto|automatic|test|placeholder)$/i.test(trimmed)
   ) {
-    throw new Error("send_reply requires a real human approval token.");
+    throw new Error(`${requester} requires a real human approval token.`);
   }
   return trimmed;
 }

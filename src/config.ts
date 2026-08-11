@@ -4,7 +4,9 @@ import type { BrowserMode, RuntimeConfig } from "./types.js";
 
 const DEFAULT_CDP_URL = "http://127.0.0.1:9222";
 
-function expandHome(value: string): string {
+export const DEFAULT_PROFILE_ID = "default";
+
+export function expandHome(value: string): string {
   if (value === "~") {
     return homedir();
   }
@@ -49,27 +51,65 @@ function browserModeEnv(name: string, defaultValue: BrowserMode): BrowserMode {
   );
 }
 
-export function loadConfig(): RuntimeConfig {
-  const dataDir =
+/**
+ * Environment-derived settings shared by every profile. Per-profile overrides in
+ * profiles.json fall back to these.
+ */
+export interface BaseSettings {
+  rootDataDir: string;
+  profilesFile: string;
+  /** True when FB_PROFILES_FILE named the path, so a missing file is an error. */
+  profilesFileIsExplicit: boolean;
+  browserMode: BrowserMode;
+  browserCdpUrl: string;
+  browserUserDataDirOverride?: string;
+  browserChannel?: string;
+  chromeProfileName?: string;
+  marketplaceCreateUrl: string;
+  marketplaceSellingUrl: string;
+  marketplaceMessagesUrl: string;
+  defaultLocation?: string;
+  headless: boolean;
+  slowMoMs: number;
+  stealth: boolean;
+  screenshotFullPage: boolean;
+}
+
+export interface ProfilePaths {
+  profileId: string;
+  label?: string;
+  /**
+   * Everything per-account (inventory.json, messages.db, screenshots, logs)
+   * derives from this directory, so profiles must not share one.
+   */
+  dataDir: string;
+  /** Authoring artifacts, deliberately pointed at the shared root. */
+  draftsDir: string;
+  photosDir: string;
+  browserUserDataDir: string;
+  browserMode?: BrowserMode;
+  browserCdpUrl?: string;
+  browserChannel?: string;
+  chromeProfileName?: string;
+  defaultLocation?: string;
+  headless?: boolean;
+}
+
+export function loadBaseSettings(): BaseSettings {
+  const rootDataDir =
     optionalEnv("FB_MARKETPLACE_DATA_DIR") ??
     path.join(homedir(), ".hermes", "facebook-marketplace");
 
-  const browserUserDataDir =
-    optionalEnv("FB_CHROME_USER_DATA_DIR") ??
-    optionalEnv("FB_CHROME_PROFILE_DIR") ??
-    path.join(dataDir, "browser-profile");
-  const browserMode = browserModeEnv("FB_BROWSER_MODE", "managed_profile");
+  const profilesFileOverride = optionalEnv("FB_PROFILES_FILE");
 
   return {
-    dataDir,
-    draftsDir: path.join(dataDir, "drafts"),
-    photosDir: path.join(dataDir, "photos"),
-    screenshotsDir: path.join(dataDir, "screenshots"),
-    logsDir: path.join(dataDir, "logs"),
-    messagesDbPath: path.join(dataDir, "messages.db"),
-    browserMode,
+    rootDataDir,
+    profilesFile: profilesFileOverride ?? path.join(rootDataDir, "profiles.json"),
+    profilesFileIsExplicit: profilesFileOverride !== undefined,
+    browserMode: browserModeEnv("FB_BROWSER_MODE", "managed_profile"),
     browserCdpUrl: optionalEnv("FB_BROWSER_CDP_URL") ?? DEFAULT_CDP_URL,
-    browserUserDataDir,
+    browserUserDataDirOverride:
+      optionalEnv("FB_CHROME_USER_DATA_DIR") ?? optionalEnv("FB_CHROME_PROFILE_DIR"),
     browserChannel: optionalEnv("FB_BROWSER_CHANNEL"),
     chromeProfileName: optionalEnv("FB_CHROME_PROFILE_NAME"),
     marketplaceCreateUrl:
@@ -84,7 +124,51 @@ export function loadConfig(): RuntimeConfig {
     defaultLocation: optionalEnv("FB_MARKETPLACE_HOME_LOCATION"),
     headless: boolEnv("FB_HEADLESS", false),
     slowMoMs: numberEnv("FB_SLOW_MO_MS", 0),
+    // Stealth is registered once on the shared playwright-extra launcher, so it
+    // cannot vary per profile.
     stealth: boolEnv("FB_STEALTH", true),
     screenshotFullPage: boolEnv("FB_SCREENSHOT_FULL_PAGE", false)
   };
+}
+
+export function makeConfig(base: BaseSettings, paths: ProfilePaths): RuntimeConfig {
+  return {
+    profileId: paths.profileId,
+    label: paths.label,
+    dataDir: paths.dataDir,
+    draftsDir: paths.draftsDir,
+    photosDir: paths.photosDir,
+    screenshotsDir: path.join(paths.dataDir, "screenshots"),
+    logsDir: path.join(paths.dataDir, "logs"),
+    messagesDbPath: path.join(paths.dataDir, "messages.db"),
+    browserMode: paths.browserMode ?? base.browserMode,
+    browserCdpUrl: paths.browserCdpUrl ?? base.browserCdpUrl,
+    browserUserDataDir: paths.browserUserDataDir,
+    browserChannel: paths.browserChannel ?? base.browserChannel,
+    chromeProfileName: paths.chromeProfileName ?? base.chromeProfileName,
+    marketplaceCreateUrl: base.marketplaceCreateUrl,
+    marketplaceSellingUrl: base.marketplaceSellingUrl,
+    marketplaceMessagesUrl: base.marketplaceMessagesUrl,
+    defaultLocation: paths.defaultLocation ?? base.defaultLocation,
+    headless: paths.headless ?? base.headless,
+    slowMoMs: base.slowMoMs,
+    stealth: base.stealth,
+    screenshotFullPage: base.screenshotFullPage
+  };
+}
+
+/**
+ * The single-account layout used when no profiles.json exists: every path stays
+ * at the data directory root, exactly where existing installs already have their
+ * logged-in browser profile, inventory, and message database.
+ */
+export function loadConfig(base = loadBaseSettings()): RuntimeConfig {
+  return makeConfig(base, {
+    profileId: DEFAULT_PROFILE_ID,
+    dataDir: base.rootDataDir,
+    draftsDir: path.join(base.rootDataDir, "drafts"),
+    photosDir: path.join(base.rootDataDir, "photos"),
+    browserUserDataDir:
+      base.browserUserDataDirOverride ?? path.join(base.rootDataDir, "browser-profile")
+  });
 }

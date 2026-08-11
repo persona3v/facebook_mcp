@@ -1,4 +1,4 @@
-export type ListingDraftStatus = "local_draft" | "form_filled";
+export type ListingDraftStatus = "local_draft" | "form_filled" | "published";
 
 export interface ListingDraft {
   draft_id: string;
@@ -15,11 +15,19 @@ export interface ListingDraft {
   status: ListingDraftStatus;
 }
 
+export type FillListingStatus =
+  | "ready_for_manual_publish"
+  | "published"
+  /** Publish was clicked but Facebook never landed on a page proving success. */
+  | "publish_unconfirmed";
+
 export interface FillListingResult {
-  status: "ready_for_manual_publish";
+  status: FillListingStatus;
   draft_id: string;
+  profile: string;
   screenshot_path: string;
-  browser_state: "waiting_on_publish_screen";
+  browser_state: "waiting_on_publish_screen" | "published_screen";
+  listing_url: string | null;
   notes: string[];
 }
 
@@ -168,7 +176,60 @@ export interface BrowserConnectionOptions {
   browserCdpUrl?: string;
 }
 
+/**
+ * Serializes the Publish click across profiles so a broadcast never pushes the
+ * same item to several accounts in the same instant.
+ */
+export type ExclusiveRunner = <T>(fn: () => Promise<T>) => Promise<T>;
+
+export interface PublishOptions {
+  approvalToken: string;
+  runExclusive?: ExclusiveRunner;
+}
+
+export interface FillListingOptions extends BrowserConnectionOptions {
+  publish?: PublishOptions;
+  /** Broadcasts clone the shared draft per account, so they skip the shared write. */
+  persistStatus?: boolean;
+}
+
+export interface ProfileSummary {
+  profile: string;
+  label: string | null;
+  is_default: boolean;
+  browser_mode: BrowserMode;
+  browser_cdp_url: string | null;
+  data_dir: string;
+  drafts_dir: string;
+  browser_user_data_dir: string;
+}
+
+export interface BroadcastProfileOutcome {
+  profile: string;
+  label: string | null;
+  status: FillListingStatus | "failed";
+  screenshot_path: string | null;
+  listing_url: string | null;
+  error: string | null;
+  notes: string[];
+}
+
+export interface BroadcastListingResult {
+  draft_id: string;
+  published: boolean;
+  succeeded: number;
+  failed: number;
+  /** Publish was clicked but not confirmed; these need a manual check. */
+  unconfirmed: number;
+  results: BroadcastProfileOutcome[];
+  started_at: string;
+  finished_at: string;
+  notes: string[];
+}
+
 export interface RuntimeConfig {
+  profileId: string;
+  label?: string;
   dataDir: string;
   draftsDir: string;
   photosDir: string;
