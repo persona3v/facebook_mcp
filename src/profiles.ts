@@ -81,6 +81,13 @@ export function loadProfiles(base: BaseSettings = loadBaseSettings()): ProfileRe
   }
 
   const profiles = new Map<string, RuntimeConfig>();
+  // With a single profile the global Chrome directory override is unambiguous,
+  // so honor it: otherwise an existing install that set FB_CHROME_USER_DATA_DIR
+  // would silently lose its logged-in session the moment it adds a profiles
+  // file. With several profiles it cannot be applied - they would all collide
+  // on one directory - so each entry must name its own.
+  const inheritsChromeDirOverride = parsed.data.profiles.length === 1;
+
   for (const entry of parsed.data.profiles) {
     if (profiles.has(entry.id)) {
       throw new Error(
@@ -104,7 +111,8 @@ export function loadProfiles(base: BaseSettings = loadBaseSettings()): ProfileRe
         photosDir: path.join(base.rootDataDir, "photos"),
         browserUserDataDir: entry.browser_user_data_dir
           ? expandHome(entry.browser_user_data_dir)
-          : path.join(dataDir, "browser-profile"),
+          : (inheritsChromeDirOverride ? base.browserUserDataDirOverride : undefined) ??
+            path.join(dataDir, "browser-profile"),
         browserMode: entry.browser_mode,
         browserCdpUrl: entry.browser_cdp_url,
         browserChannel: entry.browser_channel,
@@ -218,7 +226,7 @@ function assertDistinctBrowserTargets(
       continue;
     }
 
-    const key = config.browserCdpUrl.trim().toLowerCase();
+    const key = normalizeCdpKey(config.browserCdpUrl);
     const owner = cdpOwners.get(key);
     if (owner) {
       throw new Error(
@@ -232,6 +240,27 @@ function assertDistinctBrowserTargets(
 function normalizePathKey(value: string): string {
   const resolved = path.resolve(value);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+/**
+ * Compares endpoints by what they address, not by spelling: a trailing slash,
+ * an implicit port, or localhost vs 127.0.0.1 all reach the same Chrome, and
+ * treating them as distinct would let two profiles drive one logged-in account.
+ */
+function normalizeCdpKey(value: string): string {
+  const trimmed = value.trim();
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return trimmed.toLowerCase();
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  const host = hostname === "localhost" || hostname === "::1" ? "127.0.0.1" : hostname;
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  const pathname = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol}//${host}:${port}${pathname}`;
 }
 
 export { DEFAULT_PROFILE_ID };

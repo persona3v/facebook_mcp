@@ -10,6 +10,7 @@ import {
   getMessageThread,
   getListingDetail,
   listMyListings,
+  screenshotPathFromError,
   sendReply
 } from "./facebook.js";
 import { ensureMessageStore } from "./messageStore.js";
@@ -740,14 +741,17 @@ async function broadcastListingDraft(input: {
           notes: result.notes
         };
       } catch (error) {
+        const screenshotPath = screenshotPathFromError(error);
         return {
           profile: config.profileId,
           label: config.label ?? null,
           status: "failed",
-          screenshot_path: null,
+          screenshot_path: screenshotPath,
           listing_url: null,
           error: error instanceof Error ? error.message : String(error),
-          notes: []
+          notes: screenshotPath
+            ? [`Error screenshot saved at ${screenshotPath}`]
+            : []
         };
       }
     }

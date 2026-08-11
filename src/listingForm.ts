@@ -122,10 +122,26 @@ export async function fillListingForm(
       ).catch(() => undefined);
       if (screenshotPath) {
         notes.push(`Error screenshot saved at ${screenshotPath}`);
+        // Attach it to the error too: `notes` dies with the throw, and a
+        // broadcast's per-account catch has no other way to surface the one
+        // screenshot that explains why this account failed.
+        if (error instanceof Error) {
+          (error as ScreenshotBearingError).screenshotPath = screenshotPath;
+        }
       }
     }
     throw error;
   }
+}
+
+interface ScreenshotBearingError extends Error {
+  screenshotPath?: string;
+}
+
+export function screenshotPathFromError(error: unknown): string | null {
+  return error instanceof Error
+    ? ((error as ScreenshotBearingError).screenshotPath ?? null)
+    : null;
 }
 
 /**
